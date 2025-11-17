@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from scipy import stats
 from scipy.stats import norm
 import streamlit as st
 import yfinance as yf
@@ -95,6 +96,98 @@ def compute_corr_from_prices(prices_df: pd.DataFrame):
     if returns.empty:
         raise RuntimeError("Pas assez de données pour calculer la corrélation.")
     return returns.corr()
+
+
+class BasketOption:
+    def __init__(self, weights, prices, volatility, corr, strike, maturity, rate):
+        self.weights = weights
+        self.vol = volatility
+        self.strike = strike
+        self.mat = maturity
+        self.rate = rate
+        self.corr = corr
+        self.prices = prices
+
+    def get_mc(self, m_paths: int = 10000):
+        b_ts = stats.multivariate_normal(np.zeros(len(self.weights)), cov=self.corr).rvs(size=m_paths)
+        s_ts = self.prices * np.exp((self.rate - 0.5 * self.vol**2) * self.mat + self.vol * b_ts)
+        if len(self.weights) > 1:
+            payoffs = (np.sum(self.weights * s_ts, axis=1) - self.strike).clip(0)
+        else:
+            payoffs = np.maximum(s_ts - self.strike, np.zeros(m_paths))
+        mc_price = np.mean(payoffs)
+        return float(np.exp(-1 * self.rate * self.mat) * mc_price)
+
+    def get_bs_price(self):
+        d1 = (np.log(self.prices / self.strike) + (self.rate + 0.5 * self.vol**2) * self.mat) / (
+            self.vol * np.sqrt(self.mat)
+        )
+        d2 = d1 - self.vol * np.sqrt(self.mat)
+        bs_price = stats.norm.cdf(d1) * self.prices - stats.norm.cdf(d2) * self.strike * np.exp(
+            -self.rate * self.mat
+        )
+        return float(bs_price)
+
+
+class DataGen:
+    def __init__(self, n_assets: int, n_samples: int):
+        if n_samples <= 0:
+            raise ValueError("n_samples needs to be positive")
+        if n_assets <= 0:
+            raise ValueError("n_assets needs to be positive")
+        self.n_assets = n_assets
+        self.n_samples = n_samples
+
+    def generate(self, corr, strike_price: float, base_price: float, method: str = "bs"):
+        mats = np.random.uniform(0.2, 1.1, size=self.n_samples)
+        vols = np.random.uniform(0.01, 1, size=self.n_samples)
+        rates = np.random.uniform(0.02, 0.1, size=self.n_samples)
+
+        strikes = np.random.randn(self.n_samples) + strike_price
+        prices = np.random.randn(self.n_samples) + base_price
+
+        if self.n_assets > 1:
+            weights = np.random.rand(self.n_samples * self.n_assets).reshape((self.n_samples, self.n_assets))
+            weights /= np.sum(weights, axis=1)[:, np.newaxis]
+        else:
+            weights = np.ones((self.n_samples, self.n_assets))
+
+        labels = []
+        for i in range(self.n_samples):
+            basket = BasketOption(
+                weights[i],
+                prices[i],
+                vols[i],
+                corr,
+                strikes[i],
+                mats[i],
+                rates[i],
+            )
+            if method == "bs":
+                labels.append(basket.get_bs_price())
+            else:
+                labels.append(basket.get_mc())
+
+        data = pd.DataFrame(
+            {
+                "S/K": prices / strikes,
+                "Maturity": mats,
+                "Volatility": vols,
+                "Rate": rates,
+                "Labels": labels,
+                "Prices": prices,
+                "Strikes": strikes,
+            }
+        )
+
+        for i in range(self.n_assets):
+            data[f"Weight_{i}"] = weights[:, i]
+        return data
+
+
+def simulate_dataset_notebook(n_assets: int, n_samples: int, method: str, corr: np.ndarray, base_price: float, base_strike: float):
+    simulator = DataGen(n_assets=n_assets, n_samples=n_samples)
+    return simulator.generate(corr=corr, strike_price=base_strike, base_price=base_price, method=method)
 
 
 def compute_corr_from_yfinance(tickers, period: str = "1mo", interval: str = "1d", fallback: pd.DataFrame | None = None):
@@ -197,39 +290,47 @@ def price_basket_nn(model: tf.keras.Model, S: float, K: float, maturity: float, 
     return float(model.predict(x, verbose=0)[0, 0])
 
 
-def plot_heatmap_nn(model: tf.keras.Model, data: pd.DataFrame):
-    m_min, m_max = data["S/K"].quantile([0.01, 0.99])
-    t_min, t_max = data["Maturity"].quantile([0.01, 0.99])
-    n_S, n_T = 50, 50
-    m_vals = np.linspace(m_min, m_max, n_S)
-    t_vals = np.linspace(t_min, t_max, n_T)
-    M_grid, T_grid = np.meshgrid(m_vals, t_vals)
+def plot_heatmap_nn(model: tf.keras.Model, data: pd.DataFrame, spot_ref: float, strike_ref: float, maturity: float):
+    """Heatmap du prix NN en fonction de S et K (maturité fixée)."""
+    n_S, n_K = 50, 50
 
+    if {"Prices", "Strikes"}.issubset(data.columns):
+        s_min, s_max = data["Prices"].quantile([0.01, 0.99])
+        k_min, k_max = data["Strikes"].quantile([0.01, 0.99])
+    else:
+        s_span = max(1.0, 0.2 * spot_ref)
+        k_span = max(1.0, 0.2 * strike_ref)
+        s_min, s_max = max(0.01, spot_ref - s_span), spot_ref + s_span
+        k_min, k_max = max(0.01, strike_ref - k_span), strike_ref + k_span
+
+    s_vals = np.linspace(s_min, s_max, n_S)
+    k_vals = np.linspace(k_min, k_max, n_K)
     sigma_ref = float(data["Volatility"].median())
     rate_ref = float(data["Rate"].median())
 
-    X = np.stack(
-        [
-            M_grid.ravel(),
-            T_grid.ravel(),
-            np.full(M_grid.size, sigma_ref),
-            np.full(M_grid.size, rate_ref),
-        ],
-        axis=1,
-    )
-    prices_grid = model.predict(X, verbose=0).reshape(n_T, n_S)
+    prices_grid = np.zeros((n_S, n_K), dtype=float)
+    for i, s_ in enumerate(s_vals):
+        for j, k_ in enumerate(k_vals):
+            prices_grid[i, j] = price_basket_nn(
+                model,
+                S=float(s_),
+                K=float(k_),
+                maturity=float(maturity),
+                volatility=sigma_ref,
+                rate=rate_ref,
+            )
 
     fig, ax = plt.subplots(figsize=(6, 4))
     im = ax.imshow(
         prices_grid,
         origin="lower",
-        extent=[m_vals.min(), m_vals.max(), t_vals.min(), t_vals.max()],
+        extent=[k_vals.min(), k_vals.max(), s_vals.min(), s_vals.max()],
         aspect="auto",
         cmap="viridis",
     )
-    ax.set_xlabel("Moneyness S/K")
-    ax.set_ylabel("Maturity T (years)")
-    ax.set_title("Heatmap prix NN (S/K vs T)")
+    ax.set_xlabel("Strike K")
+    ax.set_ylabel("Spot S")
+    ax.set_title(f"Heatmap prix NN (T = {maturity:g} an(s))")
     fig.colorbar(im, ax=ax, label="Prix NN")
     plt.tight_layout()
     return fig
@@ -559,7 +660,6 @@ def compute_asian_price(
 def ui_basket_surface(spot_common, maturity_common, rate_common, strike_common):
     st.header("Basket – Pricing NN + corrélation (3 actifs)")
 
-    # Saisie des tickers (corrélation)
     col_tk = st.columns(3)
     with col_tk[0]:
         tk1 = st.text_input("Ticker 1", "AAPL", key="corr_tk1")
@@ -570,37 +670,44 @@ def ui_basket_surface(spot_common, maturity_common, rate_common, strike_common):
     period = st.selectbox("Période yfinance", ["1mo", "3mo", "6mo", "1y"], index=0, key="corr_period")
     interval = st.selectbox("Intervalle", ["1d", "1h"], index=0, key="corr_interval")
 
-    st.caption("Le calcul de corrélation utilise les prix de clôture ajustés téléchargés via yfinance. En cas d'échec, une matrice de corrélation inventée sera utilisée.")
+    st.caption("Le calcul de corrélation utilise les prix de clôture ajustés téléchargés via yfinance. En cas d'échec, une matrice fallback est utilisée.")
+
+    def _fallback_corr(n_assets: int):
+        base = np.full((n_assets, n_assets), 0.6)
+        np.fill_diagonal(base, 1.0)
+        return base
+
+    tickers = [tk1, tk2, tk3]
     corr_df = None
+    last_prices = None
     try:
-        prices = fetch_closing_prices([tk1, tk2, tk3], period=period, interval=interval)
+        prices = fetch_closing_prices(tickers, period=period, interval=interval)
+        last_prices = prices.drop(columns=["Date"]).iloc[-1]
         corr_df = compute_corr_from_prices(prices)
         st.success("Corrélation calculée")
         st.dataframe(corr_df)
     except Exception as exc:
         st.warning(f"Impossible de récupérer les données : {exc}")
-        corr_df = pd.DataFrame(
-            [
-                [1.0, 0.6, 0.4],
-                [0.6, 1.0, 0.7],
-                [0.4, 0.7, 1.0],
-            ],
-            columns=[tk1, tk2, tk3],
-            index=[tk1, tk2, tk3],
-        )
+        corr_df = pd.DataFrame(_fallback_corr(len(tickers)), columns=tickers, index=tickers)
         st.info("Utilisation d'une matrice de corrélation inventée pour la suite des calculs.")
         st.dataframe(corr_df)
 
-    st.subheader("Dataset Basket pour NN")
-    default_path = Path("data/train.csv")
-    if not default_path.exists():
-        st.error("Fichier data/train.csv introuvable. Ajoute-le puis relance l'appli.")
-        return
+    st.subheader("Dataset Basket pour NN (généré comme dans le notebook)")
+    n_samples = st.slider("Taille du dataset simulé", 1000, 20000, 10000, 1000)
+    method = st.selectbox("Méthode de pricing pour les labels", ["bs", "mc"], index=0)
+    base_price_default = float(last_prices.mean()) if last_prices is not None else 100.0
+    base_price = st.number_input("BASE_PRICE (spot de référence)", value=base_price_default, step=1.0)
+    base_strike = st.number_input("BASE_STRIKE", value=max(1.0, base_price * 2.0), step=1.0)
 
-    df = pd.read_csv(default_path)
-    source = str(default_path)
+    df = simulate_dataset_notebook(
+        n_assets=len(tickers),
+        n_samples=int(n_samples),
+        method=method,
+        corr=corr_df.values,
+        base_price=float(base_price),
+        base_strike=float(base_strike),
+    )
 
-    st.write(f"Dataset chargé depuis : {source}")
     st.write("Aperçu :", df.head())
     st.write("Shape :", df.shape)
 
@@ -638,8 +745,14 @@ def ui_basket_surface(spot_common, maturity_common, rate_common, strike_common):
         st.pyplot(fig)
 
     with col2:
-        st.subheader("Heatmap S/K vs T (prix NN)")
-        heatmap_fig = plot_heatmap_nn(model, df)
+        st.subheader("Heatmap prix NN (S vs K)")
+        heatmap_fig = plot_heatmap_nn(
+            model=model,
+            data=df,
+            spot_ref=float(spot_common),
+            strike_ref=float(strike_common),
+            maturity=float(maturity_common),
+        )
         st.pyplot(heatmap_fig)
 
     st.subheader("Surface IV (Strike, Maturité)")
