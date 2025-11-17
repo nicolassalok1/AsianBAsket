@@ -17,16 +17,15 @@ def get_option_expiries(ticker: str):
 def get_option_surface_from_yf(ticker: str, expiry: str):
     tk = yf.Ticker(ticker)
     chain = tk.option_chain(expiry)
-    expiry_dt = pd.to_datetime(expiry).tz_localize(None)
-    now_ts = pd.Timestamp.utcnow().tz_localize(None).normalize()
-    tau_years = max((expiry_dt - now_ts).total_seconds() / (365.0 * 24 * 3600), 0.0)
 
     frames = []
     for frame in [chain.calls, chain.puts]:
         tmp = frame[["strike", "impliedVolatility"]].rename(
             columns={"strike": "K", "impliedVolatility": "iv"}
         )
-        tmp["T"] = tau_years
+        # La maturité T sera imposée plus tard (via T commun) dans ui_basket_surface;
+        # on met ici une valeur neutre par défaut.
+        tmp["T"] = 0.0
         frames.append(tmp)
     df = pd.concat(frames, ignore_index=True)
     df = df.dropna(subset=["K", "iv"])
@@ -344,7 +343,7 @@ def compute_asian_price(
     )
 
 
-def ui_basket_surface(ticker, period, interval, expiry, spot_common, maturity_common, rate_common, hist_df):
+def ui_basket_surface(ticker, period, interval, spot_common, maturity_common, rate_common, hist_df):
     st.header("Surface de volatilité implicite (module Basket)")
     st.markdown(
         "Les paramètres et actions sont disponibles dans la sidebar. "
@@ -384,15 +383,27 @@ def ui_basket_surface(ticker, period, interval, expiry, spot_common, maturity_co
         )
 
     option_surface = None
-    if expiry and expiry != "N/A":
+    expiries = get_option_expiries(ticker)
+    if expiries:
         try:
-            option_surface = get_option_surface_from_yf(ticker, expiry)
+            # Choix de l'échéance dont la date est la plus proche de T commun
+            expiry_dates = [pd.to_datetime(e).date() for e in expiries]
+            target_date = (
+                pd.Timestamp.utcnow() + pd.to_timedelta(maturity_common * 365.0, unit="D")
+            ).date()
+            idx_min = int(np.argmin([abs((d - target_date).days) for d in expiry_dates]))
+            expiry_chosen = expiries[idx_min]
+            option_surface = get_option_surface_from_yf(ticker, expiry_chosen)
+            # On force la colonne T à la maturité commune
+            option_surface["T"] = float(maturity_common)
         except Exception as exc:
             st.error(f"Erreur lors de la récupération des options yfinance: {exc}")
 
     if option_surface is not None and not option_surface.empty:
         st.subheader("Surface IV (données options yfinance)")
-        st.caption(f"Échantillon: {len(option_surface)} lignes, échéance {expiry}, ticker {ticker}")
+        st.caption(
+            f"Échantillon: {len(option_surface)} lignes, ticker {ticker}, T commun = {maturity_common:.4f} ans"
+        )
         required_cols = {"K", "T", "iv"}
         if not required_cols.issubset(option_surface.columns):
             missing = required_cols - set(option_surface.columns)
@@ -481,7 +492,7 @@ def ui_asian_options(
     period,
     interval,
     spot_default,
-    sigma_default,
+    sigma_common,
     hist_df,
     maturity_common,
     strike_common,
@@ -492,8 +503,8 @@ def ui_asian_options(
     if spot_default is None:
         st.warning("Aucun téléchargement yfinance : utilisez le spot commun.")
         spot_default = 57830.0
-    if sigma_default is None:
-        sigma_default = 0.05
+    if sigma_common is None:
+        sigma_common = 0.05
     if hist_df is None:
         hist_df = pd.DataFrame()
 
@@ -505,9 +516,8 @@ def ui_asian_options(
         st.info(f"Strike commun K = {strike_common_local:.4f}")
         st.info(f"Taux sans risque commun r = {rate_common:.4f}")
     with col2:
-        sigma = st.number_input(
-            "Volatilité σ (hist. yfinance)", value=sigma_default, min_value=0.0001, key="asian_sigma"
-        )
+        sigma = sigma_common
+        st.info(f"Volatilité commune σ = {sigma:.4f}")
         maturity = maturity_common
         st.info(f"T commun = {maturity:.4f} années")
         steps = st.number_input(
@@ -523,17 +533,45 @@ def ui_asian_options(
     col_s, col_k = st.columns(2)
     with col_s:
         s_center = st.session_state.get("common_spot", spot_default)
-        s_min = st.number_input("S0 min", value=max(0.01, 0.8 * s_center), min_value=0.01, key="asian_s_min")
-        s_max = st.number_input("S0 max", value=1.2 * s_center, min_value=s_min + 0.001, key="asian_s_max")
-        n_s = st.number_input("Points S0", value=15, min_value=5, max_value=40, step=1, key="asian_n_s")
+        default_s_min = st.session_state.get("asian_s_min", max(0.01, s_center - 20.0))
+        default_s_max = st.session_state.get("asian_s_max", s_center + 20.0)
+        s_min = st.number_input(
+            "S0 min",
+            value=float(default_s_min),
+            min_value=0.01,
+            step=1.0,
+            key="asian_s_min",
+        )
+        s_max = st.number_input(
+            "S0 max",
+            value=float(default_s_max),
+            min_value=s_min + 1.0,
+            step=1.0,
+            key="asian_s_max",
+        )
+        st.caption(f"Domaine S0 utilisé: [{s_min:.2f}, {s_max:.2f}] pas 1")
     with col_k:
         k_center = st.session_state.get("common_strike", strike_common)
-        k_min = st.number_input("K min", value=max(0.01, 0.8 * k_center), min_value=0.01, key="asian_k_min")
-        k_max = st.number_input("K max", value=1.2 * k_center, min_value=k_min + 0.001, key="asian_k_max")
-        n_k = st.number_input("Points K", value=15, min_value=5, max_value=40, step=1, key="asian_n_k")
+        default_k_min = st.session_state.get("asian_k_min", max(0.01, k_center - 20.0))
+        default_k_max = st.session_state.get("asian_k_max", k_center + 20.0)
+        k_min = st.number_input(
+            "K min",
+            value=float(default_k_min),
+            min_value=0.01,
+            step=1.0,
+            key="asian_k_min",
+        )
+        k_max = st.number_input(
+            "K max",
+            value=float(default_k_max),
+            min_value=k_min + 1.0,
+            step=1.0,
+            key="asian_k_max",
+        )
+        st.caption(f"Domaine K utilisé: [{k_min:.2f}, {k_max:.2f}] pas 1")
 
-    s_vals = np.linspace(s_min, s_max, int(n_s))
-    k_vals = np.linspace(k_min, k_max, int(n_k))
+    s_vals = np.arange(s_min, s_max + 1.0, 1.0, dtype=float)
+    k_vals = np.arange(k_min, k_max + 1.0, 1.0, dtype=float)
 
     tab_btm, tab_hw = st.tabs(["BTM naïf", "Hull-White (HW_BTM)"])
 
@@ -579,45 +617,38 @@ def main():
     with st.sidebar:
         st.subheader("Recherche yfinance (commune Basket/Asian)")
         ticker = st.text_input("Ticker", value="AAPL", key="common_ticker")
-        expiries = get_option_expiries(ticker)
-        if not expiries:
-            st.caption("Aucune échéance trouvée pour ce ticker.")
-        expiry = st.selectbox(
-            "Échéance (options)",
-            options=expiries if expiries else ["N/A"],
-            index=0,
-            key="common_expiry",
-        )
-        period = st.selectbox(
-            "Période prix",
-            ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"],
-            index=3,
-            key="common_period",
-        )
-        interval = st.selectbox(
-            "Intervalle prix",
-            ["1d", "1wk", "1mo"],
-            index=0,
-            key="common_interval",
-        )
-        fetch_data = st.button("Télécharger les données yfinance", key="common_download")
+        # Période et intervalle de prix fixés
+        period = "2y"
+        interval = "1d"
+        fetch_data = st.button("Télécharger / actualiser les données yfinance", key="common_download")
 
-        if fetch_data:
+        # Téléchargement yfinance, au premier affichage, au changement de ticker,
+        # ou quand l'utilisateur clique sur le bouton.
+        yf_key = st.session_state.get("yf_key")
+        curr_key = (ticker, period, interval)
+        should_fetch = fetch_data or yf_key is None or yf_key != curr_key
+
+        if should_fetch:
             try:
                 spot_yf, sigma_yf, hist_yf = get_spot_and_hist_vol(
                     ticker, period=period, interval=interval
                 )
+                st.session_state["yf_key"] = curr_key
                 st.session_state["yf_spot"] = float(spot_yf)
                 st.session_state["yf_sigma"] = float(sigma_yf)
                 st.session_state["yf_hist_df"] = hist_yf
-                if "common_spot" not in st.session_state or st.session_state["common_spot"] == 100.0:
-                    st.session_state["common_spot"] = float(spot_yf)
-                if "common_strike" not in st.session_state or st.session_state["common_strike"] == 100.0:
-                    st.session_state["common_strike"] = float(spot_yf)
+
+                # Met à jour automatiquement les bornes S0/K des heatmaps asiatiques (+/- 20)
+                s_center = float(st.session_state.get("common_spot", spot_yf))
+                k_center = float(st.session_state.get("common_strike", spot_yf))
+                st.session_state["asian_s_min"] = max(0.01, s_center - 20.0)
+                st.session_state["asian_s_max"] = s_center + 20.0
+                st.session_state["asian_k_min"] = max(0.01, k_center - 20.0)
+                st.session_state["asian_k_max"] = k_center + 20.0
             except Exception as exc:
                 st.warning(f"Impossible de récupérer les prix pour {ticker}: {exc}")
 
-        spot_seed = st.session_state.get("common_spot", 100.0)
+        spot_seed = st.session_state.get("common_spot", st.session_state.get("yf_spot", 100.0))
         spot_common = st.number_input(
             "Spot commun S0 (pris pour les deux onglets)",
             value=spot_seed,
@@ -630,9 +661,10 @@ def main():
             min_value=0.01,
             key="common_maturity",
         )
+        strike_seed = st.session_state.get("common_strike", st.session_state.get("yf_spot", 100.0))
         strike_common = st.number_input(
             "Strike commun K (utilisé partout)",
-            value=100.0,
+            value=strike_seed,
             min_value=0.01,
             key="common_strike",
         )
@@ -643,10 +675,21 @@ def main():
             format="%.4f",
             key="common_rate",
         )
+        sigma_seed = st.session_state.get("yf_sigma", 0.2)
+        sigma_common = st.number_input(
+            "Volatilité commune σ",
+            value=float(sigma_seed),
+            min_value=0.0001,
+            key="common_sigma",
+        )
     # Récupère les données yfinance mises en cache dans la session
     hist_df = st.session_state.get("yf_hist_df", pd.DataFrame())
     spot_default = st.session_state.get("yf_spot", spot_common)
     sigma_default = st.session_state.get("yf_sigma", None)
+    sigma_common = st.session_state.get(
+        "common_sigma",
+        sigma_default if sigma_default is not None else 0.2,
+    )
 
     if not hist_df.empty:
         st.subheader("Courbe des prix de clôture (yfinance)")
@@ -659,7 +702,6 @@ def main():
             ticker=ticker,
             period=period,
             interval=interval,
-            expiry=expiry,
             spot_common=spot_common,
             maturity_common=maturity_common,
             rate_common=rate_common,
@@ -671,7 +713,7 @@ def main():
             period=period,
             interval=interval,
             spot_default=spot_default,
-            sigma_default=sigma_default,
+            sigma_common=sigma_common,
             hist_df=hist_df,
             maturity_common=maturity_common,
             strike_common=strike_common,
