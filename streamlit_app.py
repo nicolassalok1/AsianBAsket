@@ -17,8 +17,8 @@ def get_option_expiries(ticker: str):
 def get_option_surface_from_yf(ticker: str, expiry: str):
     tk = yf.Ticker(ticker)
     chain = tk.option_chain(expiry)
-    expiry_dt = pd.to_datetime(expiry)
-    now_ts = pd.Timestamp.utcnow().normalize()
+    expiry_dt = pd.to_datetime(expiry).tz_localize(None)
+    now_ts = pd.Timestamp.utcnow().tz_localize(None).normalize()
     tau_years = max((expiry_dt - now_ts).total_seconds() / (365.0 * 24 * 3600), 0.0)
 
     frames = []
@@ -35,14 +35,16 @@ def get_option_surface_from_yf(ticker: str, expiry: str):
 
 @st.cache_data(show_spinner=False)
 def get_spot_and_hist_vol(ticker: str, period: str = "6mo", interval: str = "1d"):
-    data = yf.download(ticker, period=period, interval=interval)
+    data = yf.download(ticker, period=period, interval=interval, progress=False)
     if data.empty:
         raise ValueError("Aucune donnée téléchargée.")
     close = data["Close"]
     spot = float(close.iloc[-1])
     log_returns = np.log(close / close.shift(1)).dropna()
     sigma = float(log_returns.std() * np.sqrt(252))
-    return spot, sigma, data.tail(10).reset_index()
+    hist_df = data.reset_index()
+    hist_df["Date"] = pd.to_datetime(hist_df["Date"])
+    return spot, sigma, hist_df
 
 
 def build_grid(
@@ -305,44 +307,66 @@ def bs_option_price(time, spot, strike, maturity, rate, sigma, option_kind):
     return float(price)
 
 
-def ui_basket_surface():
+def compute_asian_price(
+    strike_type: str,
+    option_type: str,
+    model: str,
+    spot: float,
+    strike: float,
+    rate: float,
+    sigma: float,
+    maturity: float,
+    steps: int,
+    m_points: int | None,
+):
+    if model == "BTM naïf":
+        return btm_asian(
+            strike_type=strike_type,
+            option_type=option_type,
+            spot=spot,
+            strike=strike,
+            rate=rate,
+            sigma=sigma,
+            maturity=maturity,
+            steps=int(steps),
+        )
+    m_points_val = int(m_points) if m_points is not None else 10
+    return hw_btm_asian(
+        strike_type=strike_type,
+        option_type=option_type,
+        spot=spot,
+        strike=strike,
+        rate=rate,
+        sigma=sigma,
+        maturity=maturity,
+        steps=int(steps),
+        m_points=m_points_val,
+    )
+
+
+def ui_basket_surface(ticker, period, interval, expiry):
     st.header("Surface de volatilité implicite (module Basket)")
     st.markdown(
         "Les paramètres et actions sont disponibles dans la sidebar. "
         "Le fichier CSV requis doit contenir les colonnes `K`, `T` et `iv`."
     )
 
-    with st.sidebar:
-        st.subheader("Paramètres Basket")
-        ticker = st.text_input("Ticker Yahoo Finance", value="AAPL", key="basket_ticker")
-        expiries = get_option_expiries(ticker)
-        if not expiries:
-            st.warning("Aucune échéance d'options récupérée pour ce ticker.")
-        expiry = st.selectbox(
-            "Échéance (options)",
-            options=expiries if expiries else ["N/A"],
-            index=0,
-            key="basket_expiry",
+    try:
+        spot_default, sigma_hist, hist_df = get_spot_and_hist_vol(
+            ticker, period=period, interval=interval
         )
-        period = st.selectbox(
-            "Période",
-            ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"],
-            index=3,
-            key="basket_period",
-        )
-        interval = st.selectbox(
-            "Intervalle",
-            ["1d", "1wk", "1mo"],
-            index=0,
-            key="basket_interval",
-        )
-        download_requested = st.button("Télécharger le CSV du ticker", key="basket_download")
+    except Exception as exc:
+        st.warning(f"Impossible de récupérer les prix pour {ticker}: {exc}")
+        spot_default, sigma_hist, hist_df = 100.0, 0.2, pd.DataFrame()
 
-        try:
-            spot_default, _, _ = get_spot_and_hist_vol(ticker, period="1mo", interval="1d")
-        except Exception:
-            spot_default = 100.0
-        spot = st.number_input("Spot S0 (auto yfinance)", value=spot_default, min_value=0.01, key="basket_spot")
+    col1, col2 = st.columns(2)
+    with col1:
+        spot = st.number_input(
+            "Spot S0 (auto yfinance)",
+            value=spot_default,
+            min_value=0.01,
+            key="basket_spot",
+        )
         k_span = st.number_input(
             "Étendue en strike autour de S0",
             value=100.0,
@@ -355,6 +379,7 @@ def ui_basket_surface():
             min_value=0.1,
             key="basket_tmax",
         )
+    with col2:
         grid_k = st.number_input(
             "Points de grille en K",
             value=100,
@@ -371,41 +396,41 @@ def ui_basket_surface():
             step=10,
             key="basket_grid_t",
         )
-        plot_requested = st.button("Construire la surface IV", key="basket_plot")
+        download_requested = st.button("Télécharger le CSV du ticker", key="basket_download")
+
+    if not hist_df.empty:
+        st.subheader("Courbe des prix de clôture (yfinance)")
+        st.line_chart(hist_df.set_index("Date")["Close"])
 
     if download_requested:
-        with st.spinner("Téléchargement en cours..."):
-            data_downloaded = yf.download(ticker, period=period, interval=interval)
-        if data_downloaded.empty:
-            st.error("Aucune donnée téléchargée. Vérifiez le ticker ou modifiez la période/intervalle.")
-        else:
-            data_reset = data_downloaded.reset_index()
-            csv_bytes = data_reset.to_csv(index=False).encode("utf-8")
-            st.success(f"Données téléchargées pour {ticker}.")
-            st.download_button(
-                label="Télécharger le CSV",
-                data=csv_bytes,
-                file_name=f"{ticker}_data.csv",
-                mime="text/csv",
-            )
-            st.dataframe(data_reset.tail(10))
+        csv_bytes = hist_df.to_csv(index=False).encode("utf-8")
+        st.success(f"Données téléchargées pour {ticker}.")
+        st.download_button(
+            label="Télécharger le CSV",
+            data=csv_bytes,
+            file_name=f"{ticker}_data.csv",
+            mime="text/csv",
+        )
+        st.dataframe(hist_df.tail(10))
 
-    if plot_requested:
+    option_surface = None
+    if expiry and expiry != "N/A":
         try:
-            data_frame = get_option_surface_from_yf(ticker, expiry)
+            option_surface = get_option_surface_from_yf(ticker, expiry)
         except Exception as exc:
             st.error(f"Erreur lors de la récupération des options yfinance: {exc}")
-            return
 
+    if option_surface is not None and not option_surface.empty:
+        st.subheader("Surface IV (données options yfinance)")
+        st.caption(f"Échantillon: {len(option_surface)} lignes, échéance {expiry}, ticker {ticker}")
         required_cols = {"K", "T", "iv"}
-        if not required_cols.issubset(data_frame.columns):
-            missing = required_cols - set(data_frame.columns)
-            st.error(f"Colonnes manquantes dans le CSV: {missing}")
+        if not required_cols.issubset(option_surface.columns):
+            missing = required_cols - set(option_surface.columns)
+            st.error(f"Colonnes manquantes dans la surface: {missing}")
             return
-
         try:
             k_grid, t_grid, iv_grid = build_grid(
-                data_frame,
+                option_surface,
                 spot=spot,
                 n_k=int(grid_k),
                 n_t=int(grid_t),
@@ -424,18 +449,18 @@ def ui_basket_surface():
             st.error(f"Erreur lors de la construction de la surface: {exc}")
 
 
-def ui_asian_options():
+def ui_asian_options(ticker, period, interval):
     st.header("Options asiatiques (module Asian)")
 
-    with st.sidebar:
-        st.subheader("Paramètres Asian")
-        ticker = st.text_input("Ticker Yahoo Finance", value="AAPL", key="asian_ticker")
-        try:
-            spot_default, sigma_default, hist_tail = get_spot_and_hist_vol(
-                ticker, period="6mo", interval="1d"
-            )
-        except Exception:
-            spot_default, sigma_default, hist_tail = 57830.0, 0.05, pd.DataFrame()
+    try:
+        spot_default, sigma_default, hist_df = get_spot_and_hist_vol(
+            ticker, period=period, interval=interval
+        )
+    except Exception:
+        spot_default, sigma_default, hist_df = 57830.0, 0.05, pd.DataFrame()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
         model = st.selectbox(
             "Schéma binomial",
             ["BTM naïf", "Hull-White (HW_BTM)"],
@@ -445,11 +470,13 @@ def ui_asian_options():
         strike_type_label = st.selectbox(
             "Type de strike asiatique", ["fixed", "floating"], key="asian_strike_type"
         )
-
-        spot = st.number_input("Spot S0 (auto yfinance)", value=spot_default, min_value=0.01, key="asian_spot")
+    with col2:
+        spot = st.number_input(
+            "Spot S0 (auto yfinance)", value=spot_default, min_value=0.01, key="asian_spot"
+        )
         strike = st.number_input("Strike K", value=spot_default, min_value=0.01, key="asian_strike")
         rate = st.number_input("Taux sans risque r", value=0.01, key="asian_rate")
-
+    with col3:
         sigma = st.number_input(
             "Volatilité σ (hist. yfinance)", value=sigma_default, min_value=0.0001, key="asian_sigma"
         )
@@ -465,7 +492,6 @@ def ui_asian_options():
             step=1,
             key="asian_steps",
         )
-
         m_points = None
         if model == "Hull-White (HW_BTM)":
             m_points = st.number_input(
@@ -476,78 +502,157 @@ def ui_asian_options():
                 step=1,
                 key="asian_m_points",
             )
-
         show_bs = st.checkbox(
             "Afficher le prix européen Black-Scholes correspondant",
             value=True,
             key="asian_show_bs",
         )
-        compute_requested = st.button("Calculer le prix asiatique", key="asian_compute")
 
-    if hist_tail is not None and not hist_tail.empty:
-        st.caption("Aperçu des dernières observations de clôture (yfinance)")
-        st.dataframe(hist_tail)
+    if hist_df is not None and not hist_df.empty:
+        st.subheader("Courbe des prix de clôture (yfinance)")
+        st.line_chart(hist_df.set_index("Date")["Close"])
 
-    if compute_requested:
-        option_type = "C" if option_label == "Call" else "P"
-        with st.spinner("Calcul en cours..."):
-            try:
-                if model == "BTM naïf":
-                    price = btm_asian(
-                        strike_type=strike_type_label,
-                        option_type=option_type,
-                        spot=spot,
-                        strike=strike,
+    option_type = "C" if option_label == "Call" else "P"
+    with st.spinner("Calcul en cours..."):
+        try:
+            price = compute_asian_price(
+                strike_type=strike_type_label,
+                option_type=option_type,
+                model=model,
+                spot=spot,
+                strike=strike,
+                rate=rate,
+                sigma=sigma,
+                maturity=maturity,
+                steps=int(steps),
+                m_points=m_points,
+            )
+        except Exception as exc:
+            st.error(f"Erreur lors du calcul asiatique: {exc}")
+            return
+
+    st.success(f"Prix de l'option asiatique: {price:.6f}")
+
+    if show_bs and strike_type_label == "fixed":
+        option_kind = "call" if option_label == "Call" else "put"
+        try:
+            euro_price = bs_option_price(
+                time=0.0,
+                spot=spot,
+                strike=strike,
+                maturity=maturity,
+                rate=rate,
+                sigma=sigma,
+                option_kind=option_kind,
+            )
+            st.info(f"Prix européen Black-Scholes (même K, T): {euro_price:.6f}")
+        except Exception as exc:
+            st.error(f"Erreur lors du calcul Black-Scholes: {exc}")
+
+    st.subheader("Heatmaps prix asiatique (S0 vs K)")
+    col_s, col_k = st.columns(2)
+    with col_s:
+        s_min = st.number_input("S0 min", value=max(0.01, 0.8 * spot_default), min_value=0.01, key="asian_s_min")
+        s_max = st.number_input("S0 max", value=1.2 * spot_default, min_value=s_min + 0.001, key="asian_s_max")
+        n_s = st.number_input("Points S0", value=15, min_value=5, max_value=40, step=1, key="asian_n_s")
+    with col_k:
+        k_min = st.number_input("K min", value=max(0.01, 0.8 * spot_default), min_value=0.01, key="asian_k_min")
+        k_max = st.number_input("K max", value=1.2 * spot_default, min_value=k_min + 0.001, key="asian_k_max")
+        n_k = st.number_input("Points K", value=15, min_value=5, max_value=40, step=1, key="asian_n_k")
+
+    s_vals = np.linspace(s_min, s_max, int(n_s))
+    k_vals = np.linspace(k_min, k_max, int(n_k))
+
+    heatmaps = {}
+    for opt_label, opt_code in [("Call", "C"), ("Put", "P")]:
+        for stype in ["fixed", "floating"]:
+            grid = np.zeros((len(s_vals), len(k_vals)))
+            for i, s_ in enumerate(s_vals):
+                for j, k_ in enumerate(k_vals):
+                    grid[i, j] = compute_asian_price(
+                        strike_type=stype,
+                        option_type=opt_code,
+                        model=model,
+                        spot=float(s_),
+                        strike=float(k_),
                         rate=rate,
                         sigma=sigma,
                         maturity=maturity,
                         steps=int(steps),
+                        m_points=m_points,
                     )
-                else:
-                    price = hw_btm_asian(
-                        strike_type=strike_type_label,
-                        option_type=option_type,
-                        spot=spot,
-                        strike=strike,
-                        rate=rate,
-                        sigma=sigma,
-                        maturity=maturity,
-                        steps=int(steps),
-                        m_points=int(m_points),
-                    )
-            except Exception as exc:
-                st.error(f"Erreur lors du calcul asiatique: {exc}")
-                return
+            heatmaps[(opt_label, stype)] = grid
 
-        st.success(f"Prix de l'option asiatique: {price:.6f}")
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    axes = axes.flatten()
+    plots = [
+        ("Call", "fixed"),
+        ("Call", "floating"),
+        ("Put", "fixed"),
+        ("Put", "floating"),
+    ]
+    for ax, (opt_label, stype) in zip(axes, plots):
+        grid = heatmaps[(opt_label, stype)]
+        im = ax.imshow(
+            grid,
+            extent=[k_vals.min(), k_vals.max(), s_vals.min(), s_vals.max()],
+            origin="lower",
+            aspect="auto",
+            cmap="viridis",
+        )
+        ax.set_xlabel("K")
+        ax.set_ylabel("S0")
+        ax.set_title(f"{opt_label} asiatique - strike {stype}")
+        fig.colorbar(im, ax=ax, label="Prix")
 
-        if show_bs and strike_type_label == "fixed":
-            option_kind = "call" if option_label == "Call" else "put"
-            try:
-                euro_price = bs_option_price(
-                    time=0.0,
-                    spot=spot,
-                    strike=strike,
-                    maturity=maturity,
-                    rate=rate,
-                    sigma=sigma,
-                    option_kind=option_kind,
-                )
-                st.info(f"Prix européen Black-Scholes (même K, T): {euro_price:.6f}")
-            except Exception as exc:
-                st.error(f"Erreur lors du calcul Black-Scholes: {exc}")
+    plt.tight_layout()
+    st.pyplot(fig)
 
 
 def main():
     st.set_page_config(page_title="Basket + Asian", layout="wide")
     st.title("Application Streamlit : Basket + Asian")
 
+    with st.sidebar:
+        st.subheader("Recherche yfinance (commune Basket/Asian)")
+        ticker = st.text_input("Ticker", value="AAPL", key="common_ticker")
+        expiries = get_option_expiries(ticker)
+        if not expiries:
+            st.caption("Aucune échéance trouvée pour ce ticker.")
+        expiry = st.selectbox(
+            "Échéance (options)",
+            options=expiries if expiries else ["N/A"],
+            index=0,
+            key="common_expiry",
+        )
+        period = st.selectbox(
+            "Période prix",
+            ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"],
+            index=3,
+            key="common_period",
+        )
+        interval = st.selectbox(
+            "Intervalle prix",
+            ["1d", "1wk", "1mo"],
+            index=0,
+            key="common_interval",
+        )
+
     tab_basket, tab_asian = st.tabs(["Surface IV (Basket)", "Options asiatiques"])
 
     with tab_basket:
-        ui_basket_surface()
+        ui_basket_surface(
+            ticker=ticker,
+            period=period,
+            interval=interval,
+            expiry=expiry,
+        )
     with tab_asian:
-        ui_asian_options()
+        ui_asian_options(
+            ticker=ticker,
+            period=period,
+            interval=interval,
+        )
 
 
 if __name__ == "__main__":
