@@ -597,17 +597,37 @@ def ui_basket_surface(spot_common, maturity_common, rate_common, strike_common):
     st.header("Basket – Pricing NN + corrélation (3 actifs)")
 
     # Saisie des tickers (corrélation)
-    col_tk = st.columns(3)
-    with col_tk[0]:
-        tk1 = st.text_input("Ticker 1", "AAPL", key="corr_tk1")
-    with col_tk[1]:
-        tk2 = st.text_input("Ticker 2", "SPY", key="corr_tk2")
-    with col_tk[2]:
-        tk3 = st.text_input("Ticker 3", "MSFT", key="corr_tk3")
+    if "basket_tickers" not in st.session_state:
+        st.session_state["basket_tickers"] = ["AAPL", "SPY", "MSFT"]
+
+    min_assets, max_assets = 2, 10
+    with st.container():
+        st.subheader("Sélection des assets (2 à 10)")
+        btn_col_add, btn_col_remove = st.columns(2)
+        with btn_col_add:
+            if st.button("Ajouter un asset", disabled=len(st.session_state["basket_tickers"]) >= max_assets):
+                st.session_state["basket_tickers"].append(f"TICKER{len(st.session_state['basket_tickers']) + 1}")
+        with btn_col_remove:
+            if st.button("Retirer un asset", disabled=len(st.session_state["basket_tickers"]) <= min_assets):
+                st.session_state["basket_tickers"].pop()
+
+        # Champs de saisie dynamiques (3 par ligne)
+        tickers = []
+        for i, default_tk in enumerate(st.session_state["basket_tickers"]):
+            if i % 3 == 0:
+                cols = st.columns(3)
+            col = cols[i % 3]
+            with col:
+                tick = st.text_input(f"Ticker {i + 1}", value=default_tk, key=f"corr_tk_dynamic_{i}")
+                tickers.append(tick.strip() or default_tk)
+        # Met à jour la session avec les saisies (borne le nombre)
+        tickers = tickers[:max_assets]
+        if len(tickers) < min_assets:
+            tickers += ["SPY"] * (min_assets - len(tickers))
+        st.session_state["basket_tickers"] = tickers
+
     period = st.selectbox("Période yfinance", ["1mo", "3mo", "6mo", "1y"], index=0, key="corr_period")
     interval = st.selectbox("Intervalle", ["1d", "1h"], index=0, key="corr_interval")
-
-    tickers = [tk1, tk2, tk3]
 
     st.caption("Le calcul de corrélation utilise les prix de clôture ajustés téléchargés via yfinance. En cas d'échec, une matrice de corrélation inventée sera utilisée.")
     # Génère closing_prices.csv via le script dédié (avec les tickers saisis)
