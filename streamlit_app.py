@@ -419,99 +419,35 @@ def ui_basket_surface(ticker, period, interval, expiry, spot_common, maturity_co
             st.error(f"Erreur lors de la construction de la surface: {exc}")
 
 
-def ui_asian_options(
-    ticker,
-    period,
-    interval,
-    spot_default,
-    sigma_default,
-    hist_df,
-    maturity_common,
+def _render_asian_heatmaps_for_model(
+    model,
+    s_vals,
+    k_vals,
+    sigma,
+    maturity,
+    steps,
+    m_points,
     strike_common,
     rate_common,
 ):
-    st.header("Options asiatiques (module Asian)")
-
-    if spot_default is None:
-        st.warning("Aucun téléchargement yfinance : utilisez le spot commun.")
-        spot_default = 57830.0
-    if sigma_default is None:
-        sigma_default = 0.05
-    if hist_df is None:
-        hist_df = pd.DataFrame()
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        model = st.selectbox(
-            "Schéma binomial",
-            ["BTM naïf", "Hull-White (HW_BTM)"],
-            key="asian_model",
-        )
-    with col2:
-        spot = st.number_input(
-            "Spot S0 (auto yfinance)", value=spot_default, min_value=0.01, key="asian_spot"
-        )
-        strike = st.number_input("Strike K", value=strike_common, min_value=0.01, key="asian_strike")
-        rate = rate_common
-        st.info(f"Taux sans risque commun r = {rate:.4f}")
-    with col3:
-        sigma = st.number_input(
-            "Volatilité σ (hist. yfinance)", value=sigma_default, min_value=0.0001, key="asian_sigma"
-        )
-        maturity = maturity_common
-        st.info(f"T commun = {maturity:.4f} années")
-        max_steps = 15 if model == "BTM naïf" else 60
-        steps = st.number_input(
-            "Nombre de pas N",
-            value=10,
-            min_value=1,
-            max_value=max_steps,
-            step=1,
-            key="asian_steps",
-        )
-        m_points = None
-        if model == "Hull-White (HW_BTM)":
-            m_points = st.number_input(
-                "Nombre de points de moyenne M",
-                value=10,
-                min_value=2,
-                max_value=200,
-                step=1,
-                key="asian_m_points",
-            )
-
-    st.subheader("Heatmaps prix asiatique (S0 vs K)")
-    col_s, col_k = st.columns(2)
-    with col_s:
-        s_min = st.number_input("S0 min", value=max(0.01, 0.8 * spot_default), min_value=0.01, key="asian_s_min")
-        s_max = st.number_input("S0 max", value=1.2 * spot_default, min_value=s_min + 0.001, key="asian_s_max")
-        n_s = st.number_input("Points S0", value=15, min_value=5, max_value=40, step=1, key="asian_n_s")
-    with col_k:
-        k_min = st.number_input("K min", value=max(0.01, 0.8 * spot_default), min_value=0.01, key="asian_k_min")
-        k_max = st.number_input("K max", value=1.2 * spot_default, min_value=k_min + 0.001, key="asian_k_max")
-        n_k = st.number_input("Points K", value=15, min_value=5, max_value=40, step=1, key="asian_n_k")
-
-    s_vals = np.linspace(s_min, s_max, int(n_s))
-    k_vals = np.linspace(k_min, k_max, int(n_k))
-
     heatmaps = {}
     for opt_label, opt_code in [("Call", "C"), ("Put", "P")]:
         for stype in ["fixed", "floating"]:
             grid = np.zeros((len(s_vals), len(k_vals)))
             for i, s_ in enumerate(s_vals):
-                for j, k_ in enumerate(k_vals):
+                for j, _ in enumerate(k_vals):
                     grid[i, j] = compute_asian_price(
                         strike_type=stype,
                         option_type=opt_code,
                         model=model,
                         spot=float(s_),
-            strike=strike_common,
-            rate=rate_common,
-            sigma=sigma,
-            maturity=maturity,
-            steps=int(steps),
-            m_points=m_points,
-        )
+                        strike=float(strike_common),
+                        rate=rate_common,
+                        sigma=sigma,
+                        maturity=maturity,
+                        steps=int(steps),
+                        m_points=m_points,
+                    )
             heatmaps[(opt_label, stype)] = grid
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
@@ -538,6 +474,102 @@ def ui_asian_options(
 
     plt.tight_layout()
     st.pyplot(fig)
+
+
+def ui_asian_options(
+    ticker,
+    period,
+    interval,
+    spot_default,
+    sigma_default,
+    hist_df,
+    maturity_common,
+    strike_common,
+    rate_common,
+):
+    st.header("Options asiatiques (module Asian)")
+
+    if spot_default is None:
+        st.warning("Aucun téléchargement yfinance : utilisez le spot commun.")
+        spot_default = 57830.0
+    if sigma_default is None:
+        sigma_default = 0.05
+    if hist_df is None:
+        hist_df = pd.DataFrame()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        spot_common = st.session_state.get("common_spot", spot_default)
+        strike_common_local = st.session_state.get("common_strike", strike_common)
+        st.info(f"Spot commun S0 = {spot_common:.4f}")
+        st.info(f"Strike commun K = {strike_common_local:.4f}")
+        st.info(f"Taux sans risque commun r = {rate_common:.4f}")
+    with col2:
+        sigma = st.number_input(
+            "Volatilité σ (hist. yfinance)", value=sigma_default, min_value=0.0001, key="asian_sigma"
+        )
+        maturity = maturity_common
+        st.info(f"T commun = {maturity:.4f} années")
+        steps = st.number_input(
+            "Nombre de pas N",
+            value=10,
+            min_value=1,
+            max_value=60,
+            step=1,
+            key="asian_steps",
+        )
+
+    st.subheader("Heatmaps prix asiatique (S0 vs K)")
+    col_s, col_k = st.columns(2)
+    with col_s:
+        s_center = st.session_state.get("common_spot", spot_default)
+        s_min = st.number_input("S0 min", value=max(0.01, 0.8 * s_center), min_value=0.01, key="asian_s_min")
+        s_max = st.number_input("S0 max", value=1.2 * s_center, min_value=s_min + 0.001, key="asian_s_max")
+        n_s = st.number_input("Points S0", value=15, min_value=5, max_value=40, step=1, key="asian_n_s")
+    with col_k:
+        k_center = st.session_state.get("common_strike", strike_common)
+        k_min = st.number_input("K min", value=max(0.01, 0.8 * k_center), min_value=0.01, key="asian_k_min")
+        k_max = st.number_input("K max", value=1.2 * k_center, min_value=k_min + 0.001, key="asian_k_max")
+        n_k = st.number_input("Points K", value=15, min_value=5, max_value=40, step=1, key="asian_n_k")
+
+    s_vals = np.linspace(s_min, s_max, int(n_s))
+    k_vals = np.linspace(k_min, k_max, int(n_k))
+
+    tab_btm, tab_hw = st.tabs(["BTM naïf", "Hull-White (HW_BTM)"])
+
+    with tab_btm:
+        _render_asian_heatmaps_for_model(
+            model="BTM naïf",
+            s_vals=s_vals,
+            k_vals=k_vals,
+            sigma=sigma,
+            maturity=maturity,
+            steps=steps,
+            m_points=None,
+            strike_common=strike_common_local,
+            rate_common=rate_common,
+        )
+
+    with tab_hw:
+        m_points = st.number_input(
+            "Nombre de points de moyenne M (Hull-White)",
+            value=10,
+            min_value=2,
+            max_value=200,
+            step=1,
+            key="asian_m_points_hw",
+        )
+        _render_asian_heatmaps_for_model(
+            model="Hull-White (HW_BTM)",
+            s_vals=s_vals,
+            k_vals=k_vals,
+            sigma=sigma,
+            maturity=maturity,
+            steps=steps,
+            m_points=m_points,
+            strike_common=strike_common_local,
+            rate_common=rate_common,
+        )
 
 
 def main():
@@ -569,9 +601,26 @@ def main():
             key="common_interval",
         )
         fetch_data = st.button("Télécharger les données yfinance", key="common_download")
+
+        if fetch_data:
+            try:
+                spot_yf, sigma_yf, hist_yf = get_spot_and_hist_vol(
+                    ticker, period=period, interval=interval
+                )
+                st.session_state["yf_spot"] = float(spot_yf)
+                st.session_state["yf_sigma"] = float(sigma_yf)
+                st.session_state["yf_hist_df"] = hist_yf
+                if "common_spot" not in st.session_state or st.session_state["common_spot"] == 100.0:
+                    st.session_state["common_spot"] = float(spot_yf)
+                if "common_strike" not in st.session_state or st.session_state["common_strike"] == 100.0:
+                    st.session_state["common_strike"] = float(spot_yf)
+            except Exception as exc:
+                st.warning(f"Impossible de récupérer les prix pour {ticker}: {exc}")
+
+        spot_seed = st.session_state.get("common_spot", 100.0)
         spot_common = st.number_input(
             "Spot commun S0 (pris pour les deux onglets)",
-            value=100.0,
+            value=spot_seed,
             min_value=0.01,
             key="common_spot",
         )
@@ -594,23 +643,12 @@ def main():
             format="%.4f",
             key="common_rate",
         )
+    # Récupère les données yfinance mises en cache dans la session
+    hist_df = st.session_state.get("yf_hist_df", pd.DataFrame())
+    spot_default = st.session_state.get("yf_spot", spot_common)
+    sigma_default = st.session_state.get("yf_sigma", None)
 
-    hist_df = pd.DataFrame()
-    spot_default = spot_common
-    sigma_default = None
-
-    if fetch_data:
-        try:
-            spot_default, sigma_default, hist_df = get_spot_and_hist_vol(
-                ticker, period=period, interval=interval
-            )
-            spot_common = spot_default
-            strike_common = strike_common if strike_common != 100.0 else spot_default
-        except Exception as exc:
-            st.warning(f"Impossible de récupérer les prix pour {ticker}: {exc}")
-            spot_default, sigma_default, hist_df = spot_common, 0.2, pd.DataFrame()
-
-    if fetch_data and not hist_df.empty:
+    if not hist_df.empty:
         st.subheader("Courbe des prix de clôture (yfinance)")
         st.line_chart(hist_df.set_index("Date")["Close"])
 
