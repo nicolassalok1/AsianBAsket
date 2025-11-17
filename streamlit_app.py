@@ -344,7 +344,7 @@ def compute_asian_price(
     )
 
 
-def ui_basket_surface(ticker, period, interval, expiry, spot_common, maturity_common, hist_df):
+def ui_basket_surface(ticker, period, interval, expiry, spot_common, maturity_common, rate_common, hist_df):
     st.header("Surface de volatilité implicite (module Basket)")
     st.markdown(
         "Les paramètres et actions sont disponibles dans la sidebar. "
@@ -358,6 +358,7 @@ def ui_basket_surface(ticker, period, interval, expiry, spot_common, maturity_co
     with col1:
         st.info(f"Spot commun S0 = {spot_common:.4f}")
         st.info(f"T commun = {maturity_common:.4f} années")
+        st.info(f"Taux sans risque commun r = {rate_common:.4f}")
         k_span = st.number_input(
             "Étendue en strike autour de S0",
             value=100.0,
@@ -381,22 +382,6 @@ def ui_basket_surface(ticker, period, interval, expiry, spot_common, maturity_co
             step=10,
             key="basket_grid_t",
         )
-        download_requested = st.button("Télécharger le CSV du ticker", key="basket_download")
-
-    if not hist_df.empty:
-        st.subheader("Courbe des prix de clôture (yfinance)")
-        st.line_chart(hist_df.set_index("Date")["Close"])
-
-    if download_requested:
-        csv_bytes = hist_df.to_csv(index=False).encode("utf-8")
-        st.success(f"Données téléchargées pour {ticker}.")
-        st.download_button(
-            label="Télécharger le CSV",
-            data=csv_bytes,
-            file_name=f"{ticker}_data.csv",
-            mime="text/csv",
-        )
-        st.dataframe(hist_df.tail(10))
 
     option_surface = None
     if expiry and expiry != "N/A":
@@ -434,10 +419,21 @@ def ui_basket_surface(ticker, period, interval, expiry, spot_common, maturity_co
             st.error(f"Erreur lors de la construction de la surface: {exc}")
 
 
-def ui_asian_options(ticker, period, interval, spot_default, sigma_default, hist_df):
+def ui_asian_options(
+    ticker,
+    period,
+    interval,
+    spot_default,
+    sigma_default,
+    hist_df,
+    maturity_common,
+    strike_common,
+    rate_common,
+):
     st.header("Options asiatiques (module Asian)")
 
     if spot_default is None:
+        st.warning("Aucun téléchargement yfinance : utilisez le spot commun.")
         spot_default = 57830.0
     if sigma_default is None:
         sigma_default = 0.05
@@ -455,15 +451,15 @@ def ui_asian_options(ticker, period, interval, spot_default, sigma_default, hist
         spot = st.number_input(
             "Spot S0 (auto yfinance)", value=spot_default, min_value=0.01, key="asian_spot"
         )
-        strike = st.number_input("Strike K", value=spot_default, min_value=0.01, key="asian_strike")
-        rate = st.number_input("Taux sans risque r", value=0.01, key="asian_rate")
+        strike = st.number_input("Strike K", value=strike_common, min_value=0.01, key="asian_strike")
+        rate = rate_common
+        st.info(f"Taux sans risque commun r = {rate:.4f}")
     with col3:
         sigma = st.number_input(
             "Volatilité σ (hist. yfinance)", value=sigma_default, min_value=0.0001, key="asian_sigma"
         )
-        maturity = st.number_input(
-            "Maturité T (années)", value=1.0, min_value=0.01, key="asian_maturity"
-        )
+        maturity = maturity_common
+        st.info(f"T commun = {maturity:.4f} années")
         max_steps = 15 if model == "BTM naïf" else 60
         steps = st.number_input(
             "Nombre de pas N",
@@ -483,10 +479,6 @@ def ui_asian_options(ticker, period, interval, spot_default, sigma_default, hist
                 step=1,
                 key="asian_m_points",
             )
-
-    if hist_df is not None and not hist_df.empty:
-        st.subheader("Courbe des prix de clôture (yfinance)")
-        st.line_chart(hist_df.set_index("Date")["Close"])
 
     st.subheader("Heatmaps prix asiatique (S0 vs K)")
     col_s, col_k = st.columns(2)
@@ -513,13 +505,13 @@ def ui_asian_options(ticker, period, interval, spot_default, sigma_default, hist
                         option_type=opt_code,
                         model=model,
                         spot=float(s_),
-                        strike=float(k_),
-                        rate=rate,
-                        sigma=sigma,
-                        maturity=maturity,
-                        steps=int(steps),
-                        m_points=m_points,
-                    )
+            strike=strike_common,
+            rate=rate_common,
+            sigma=sigma,
+            maturity=maturity,
+            steps=int(steps),
+            m_points=m_points,
+        )
             heatmaps[(opt_label, stype)] = grid
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
@@ -576,16 +568,49 @@ def main():
             index=0,
             key="common_interval",
         )
-
-    try:
-        spot_default, sigma_default, hist_df = get_spot_and_hist_vol(
-            ticker, period=period, interval=interval
+        fetch_data = st.button("Télécharger les données yfinance", key="common_download")
+        spot_common = st.number_input(
+            "Spot commun S0 (pris pour les deux onglets)",
+            value=100.0,
+            min_value=0.01,
+            key="common_spot",
         )
-    except Exception as exc:
-        st.warning(f"Impossible de récupérer les prix pour {ticker}: {exc}")
-        spot_default, sigma_default, hist_df = 100.0, 0.2, pd.DataFrame()
+        maturity_common = st.number_input(
+            "T commun (années, utilisé partout)",
+            value=1.0,
+            min_value=0.01,
+            key="common_maturity",
+        )
+        strike_common = st.number_input(
+            "Strike commun K (utilisé partout)",
+            value=100.0,
+            min_value=0.01,
+            key="common_strike",
+        )
+        rate_common = st.number_input(
+            "Taux sans risque commun r",
+            value=0.01,
+            step=0.001,
+            format="%.4f",
+            key="common_rate",
+        )
 
-    if not hist_df.empty:
+    hist_df = pd.DataFrame()
+    spot_default = spot_common
+    sigma_default = None
+
+    if fetch_data:
+        try:
+            spot_default, sigma_default, hist_df = get_spot_and_hist_vol(
+                ticker, period=period, interval=interval
+            )
+            spot_common = spot_default
+            strike_common = strike_common if strike_common != 100.0 else spot_default
+        except Exception as exc:
+            st.warning(f"Impossible de récupérer les prix pour {ticker}: {exc}")
+            spot_default, sigma_default, hist_df = spot_common, 0.2, pd.DataFrame()
+
+    if fetch_data and not hist_df.empty:
         st.subheader("Courbe des prix de clôture (yfinance)")
         st.line_chart(hist_df.set_index("Date")["Close"])
 
@@ -597,7 +622,9 @@ def main():
             period=period,
             interval=interval,
             expiry=expiry,
-            spot_default=spot_default,
+            spot_common=spot_common,
+            maturity_common=maturity_common,
+            rate_common=rate_common,
             hist_df=hist_df,
         )
     with tab_asian:
@@ -608,6 +635,9 @@ def main():
             spot_default=spot_default,
             sigma_default=sigma_default,
             hist_df=hist_df,
+            maturity_common=maturity_common,
+            strike_common=strike_common,
+            rate_common=rate_common,
         )
 
 
