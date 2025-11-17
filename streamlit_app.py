@@ -9,6 +9,8 @@ import yfinance as yf
 import io
 import tensorflow as tf
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -608,17 +610,24 @@ def ui_basket_surface(spot_common, maturity_common, rate_common, strike_common):
     tickers = [tk1, tk2, tk3]
 
     st.caption("Le calcul de corrélation utilise les prix de clôture ajustés téléchargés via yfinance. En cas d'échec, une matrice de corrélation inventée sera utilisée.")
+    # Génère closing_prices.csv via le script dédié (avec les tickers saisis)
+    try:
+        cmd = [sys.executable, "fetch_closing_prices.py", "--tickers", *tickers, "--output", "closing_prices.csv"]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        st.info(f"closing_prices.csv généré via le script ({res.stdout.strip()})")
+    except Exception as exc:
+        st.warning(f"Impossible d'exécuter fetch_closing_prices.py : {exc}")
+
     corr_df = None
     try:
-        prices = fetch_closing_prices(tickers, period=period, interval=interval)
-        # Stocke closing_prices.csv pour réutilisation ultérieure
-        Path("closing_prices.csv").parent.mkdir(parents=True, exist_ok=True)
-        prices.to_csv("closing_prices.csv", index=False)
+        # Charge la matrice de corrélation depuis closing_prices.csv généré ci-dessus
+        closing_path = Path("closing_prices.csv")
+        prices = pd.read_csv(closing_path)
         corr_df = compute_corr_from_prices(prices)
-        st.success("Corrélation calculée")
+        st.success(f"Corrélation calculée à partir de {closing_path.name}")
         st.dataframe(corr_df)
     except Exception as exc:
-        st.warning(f"Impossible de récupérer les données : {exc}")
+        st.warning(f"Impossible de calculer la corrélation depuis closing_prices.csv : {exc}")
         corr_df = pd.DataFrame(
             [
                 [1.0, 0.6, 0.4],
