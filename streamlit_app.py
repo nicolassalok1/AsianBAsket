@@ -344,40 +344,25 @@ def compute_asian_price(
     )
 
 
-def ui_basket_surface(ticker, period, interval, expiry):
+def ui_basket_surface(ticker, period, interval, expiry, spot_common, maturity_common, hist_df):
     st.header("Surface de volatilité implicite (module Basket)")
     st.markdown(
         "Les paramètres et actions sont disponibles dans la sidebar. "
         "Le fichier CSV requis doit contenir les colonnes `K`, `T` et `iv`."
     )
 
-    try:
-        spot_default, sigma_hist, hist_df = get_spot_and_hist_vol(
-            ticker, period=period, interval=interval
-        )
-    except Exception as exc:
-        st.warning(f"Impossible de récupérer les prix pour {ticker}: {exc}")
-        spot_default, sigma_hist, hist_df = 100.0, 0.2, pd.DataFrame()
+    if hist_df is None:
+        hist_df = pd.DataFrame()
 
     col1, col2 = st.columns(2)
     with col1:
-        spot = st.number_input(
-            "Spot S0 (auto yfinance)",
-            value=spot_default,
-            min_value=0.01,
-            key="basket_spot",
-        )
+        st.info(f"Spot commun S0 = {spot_common:.4f}")
+        st.info(f"T commun = {maturity_common:.4f} années")
         k_span = st.number_input(
             "Étendue en strike autour de S0",
             value=100.0,
             min_value=1.0,
             key="basket_k_span",
-        )
-        max_maturity = st.number_input(
-            "Maturité maximale T_max (années)",
-            value=2.0,
-            min_value=0.1,
-            key="basket_tmax",
         )
     with col2:
         grid_k = st.number_input(
@@ -431,33 +416,33 @@ def ui_basket_surface(ticker, period, interval, expiry):
         try:
             k_grid, t_grid, iv_grid = build_grid(
                 option_surface,
-                spot=spot,
+                spot=spot_common,
                 n_k=int(grid_k),
                 n_t=int(grid_t),
                 k_span=k_span,
                 t_min=0.0,
-                t_max=max_maturity,
+                t_max=maturity_common,
             )
             fig = make_iv_surface_figure(
                 k_grid,
                 t_grid,
                 iv_grid,
-                title_suffix=f" (S0={spot})",
+                title_suffix=f" (S0={spot_common})",
             )
             st.pyplot(fig)
         except Exception as exc:
             st.error(f"Erreur lors de la construction de la surface: {exc}")
 
 
-def ui_asian_options(ticker, period, interval):
+def ui_asian_options(ticker, period, interval, spot_default, sigma_default, hist_df):
     st.header("Options asiatiques (module Asian)")
 
-    try:
-        spot_default, sigma_default, hist_df = get_spot_and_hist_vol(
-            ticker, period=period, interval=interval
-        )
-    except Exception:
-        spot_default, sigma_default, hist_df = 57830.0, 0.05, pd.DataFrame()
+    if spot_default is None:
+        spot_default = 57830.0
+    if sigma_default is None:
+        sigma_default = 0.05
+    if hist_df is None:
+        hist_df = pd.DataFrame()
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -465,10 +450,6 @@ def ui_asian_options(ticker, period, interval):
             "Schéma binomial",
             ["BTM naïf", "Hull-White (HW_BTM)"],
             key="asian_model",
-        )
-        option_label = st.selectbox("Type d'option", ["Call", "Put"], key="asian_option_label")
-        strike_type_label = st.selectbox(
-            "Type de strike asiatique", ["fixed", "floating"], key="asian_strike_type"
         )
     with col2:
         spot = st.number_input(
@@ -502,52 +483,10 @@ def ui_asian_options(ticker, period, interval):
                 step=1,
                 key="asian_m_points",
             )
-        show_bs = st.checkbox(
-            "Afficher le prix européen Black-Scholes correspondant",
-            value=True,
-            key="asian_show_bs",
-        )
 
     if hist_df is not None and not hist_df.empty:
         st.subheader("Courbe des prix de clôture (yfinance)")
         st.line_chart(hist_df.set_index("Date")["Close"])
-
-    option_type = "C" if option_label == "Call" else "P"
-    with st.spinner("Calcul en cours..."):
-        try:
-            price = compute_asian_price(
-                strike_type=strike_type_label,
-                option_type=option_type,
-                model=model,
-                spot=spot,
-                strike=strike,
-                rate=rate,
-                sigma=sigma,
-                maturity=maturity,
-                steps=int(steps),
-                m_points=m_points,
-            )
-        except Exception as exc:
-            st.error(f"Erreur lors du calcul asiatique: {exc}")
-            return
-
-    st.success(f"Prix de l'option asiatique: {price:.6f}")
-
-    if show_bs and strike_type_label == "fixed":
-        option_kind = "call" if option_label == "Call" else "put"
-        try:
-            euro_price = bs_option_price(
-                time=0.0,
-                spot=spot,
-                strike=strike,
-                maturity=maturity,
-                rate=rate,
-                sigma=sigma,
-                option_kind=option_kind,
-            )
-            st.info(f"Prix européen Black-Scholes (même K, T): {euro_price:.6f}")
-        except Exception as exc:
-            st.error(f"Erreur lors du calcul Black-Scholes: {exc}")
 
     st.subheader("Heatmaps prix asiatique (S0 vs K)")
     col_s, col_k = st.columns(2)
@@ -638,6 +577,18 @@ def main():
             key="common_interval",
         )
 
+    try:
+        spot_default, sigma_default, hist_df = get_spot_and_hist_vol(
+            ticker, period=period, interval=interval
+        )
+    except Exception as exc:
+        st.warning(f"Impossible de récupérer les prix pour {ticker}: {exc}")
+        spot_default, sigma_default, hist_df = 100.0, 0.2, pd.DataFrame()
+
+    if not hist_df.empty:
+        st.subheader("Courbe des prix de clôture (yfinance)")
+        st.line_chart(hist_df.set_index("Date")["Close"])
+
     tab_basket, tab_asian = st.tabs(["Surface IV (Basket)", "Options asiatiques"])
 
     with tab_basket:
@@ -646,12 +597,17 @@ def main():
             period=period,
             interval=interval,
             expiry=expiry,
+            spot_default=spot_default,
+            hist_df=hist_df,
         )
     with tab_asian:
         ui_asian_options(
             ticker=ticker,
             period=period,
             interval=interval,
+            spot_default=spot_default,
+            sigma_default=sigma_default,
+            hist_df=hist_df,
         )
 
 
