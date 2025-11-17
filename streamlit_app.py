@@ -4,6 +4,45 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.stats import norm
 import streamlit as st
+import yfinance as yf
+
+
+@st.cache_data(show_spinner=False)
+def get_option_expiries(ticker: str):
+    tk = yf.Ticker(ticker)
+    return tk.options or []
+
+
+@st.cache_data(show_spinner=False)
+def get_option_surface_from_yf(ticker: str, expiry: str):
+    tk = yf.Ticker(ticker)
+    chain = tk.option_chain(expiry)
+    expiry_dt = pd.to_datetime(expiry)
+    now_ts = pd.Timestamp.utcnow().normalize()
+    tau_years = max((expiry_dt - now_ts).total_seconds() / (365.0 * 24 * 3600), 0.0)
+
+    frames = []
+    for frame in [chain.calls, chain.puts]:
+        tmp = frame[["strike", "impliedVolatility"]].rename(
+            columns={"strike": "K", "impliedVolatility": "iv"}
+        )
+        tmp["T"] = tau_years
+        frames.append(tmp)
+    df = pd.concat(frames, ignore_index=True)
+    df = df.dropna(subset=["K", "iv"])
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def get_spot_and_hist_vol(ticker: str, period: str = "6mo", interval: str = "1d"):
+    data = yf.download(ticker, period=period, interval=interval)
+    if data.empty:
+        raise ValueError("Aucune donnée téléchargée.")
+    close = data["Close"]
+    spot = float(close.iloc[-1])
+    log_returns = np.log(close / close.shift(1)).dropna()
+    sigma = float(log_returns.std() * np.sqrt(252))
+    return spot, sigma, data.tail(10).reset_index()
 
 
 def build_grid(
@@ -269,26 +308,93 @@ def bs_option_price(time, spot, strike, maturity, rate, sigma, option_kind):
 def ui_basket_surface():
     st.header("Surface de volatilité implicite (module Basket)")
     st.markdown(
-        "Chargez un fichier CSV contenant les colonnes `K`, `T` et `iv` "
-        "(par exemple `Basket/data/train.csv`)."
+        "Les paramètres et actions sont disponibles dans la sidebar. "
+        "Le fichier CSV requis doit contenir les colonnes `K`, `T` et `iv`."
     )
 
-    uploaded = st.file_uploader("Fichier CSV", type=["csv"])
+    with st.sidebar:
+        st.subheader("Paramètres Basket")
+        ticker = st.text_input("Ticker Yahoo Finance", value="AAPL", key="basket_ticker")
+        expiries = get_option_expiries(ticker)
+        if not expiries:
+            st.warning("Aucune échéance d'options récupérée pour ce ticker.")
+        expiry = st.selectbox(
+            "Échéance (options)",
+            options=expiries if expiries else ["N/A"],
+            index=0,
+            key="basket_expiry",
+        )
+        period = st.selectbox(
+            "Période",
+            ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"],
+            index=3,
+            key="basket_period",
+        )
+        interval = st.selectbox(
+            "Intervalle",
+            ["1d", "1wk", "1mo"],
+            index=0,
+            key="basket_interval",
+        )
+        download_requested = st.button("Télécharger le CSV du ticker", key="basket_download")
 
-    col_left, col_right = st.columns(2)
-    with col_left:
-        spot = st.number_input("Spot S0", value=100.0, min_value=0.01)
-        k_span = st.number_input("Étendue en strike autour de S0", value=100.0, min_value=1.0)
-    with col_right:
-        max_maturity = st.number_input("Maturité maximale T_max (années)", value=2.0, min_value=0.1)
-        grid_k = st.number_input("Points de grille en K", value=100, min_value=20, max_value=400, step=10)
-        grid_t = st.number_input("Points de grille en T", value=100, min_value=20, max_value=400, step=10)
-
-    if uploaded is not None:
         try:
-            data_frame = pd.read_csv(uploaded)
+            spot_default, _, _ = get_spot_and_hist_vol(ticker, period="1mo", interval="1d")
+        except Exception:
+            spot_default = 100.0
+        spot = st.number_input("Spot S0 (auto yfinance)", value=spot_default, min_value=0.01, key="basket_spot")
+        k_span = st.number_input(
+            "Étendue en strike autour de S0",
+            value=100.0,
+            min_value=1.0,
+            key="basket_k_span",
+        )
+        max_maturity = st.number_input(
+            "Maturité maximale T_max (années)",
+            value=2.0,
+            min_value=0.1,
+            key="basket_tmax",
+        )
+        grid_k = st.number_input(
+            "Points de grille en K",
+            value=100,
+            min_value=20,
+            max_value=400,
+            step=10,
+            key="basket_grid_k",
+        )
+        grid_t = st.number_input(
+            "Points de grille en T",
+            value=100,
+            min_value=20,
+            max_value=400,
+            step=10,
+            key="basket_grid_t",
+        )
+        plot_requested = st.button("Construire la surface IV", key="basket_plot")
+
+    if download_requested:
+        with st.spinner("Téléchargement en cours..."):
+            data_downloaded = yf.download(ticker, period=period, interval=interval)
+        if data_downloaded.empty:
+            st.error("Aucune donnée téléchargée. Vérifiez le ticker ou modifiez la période/intervalle.")
+        else:
+            data_reset = data_downloaded.reset_index()
+            csv_bytes = data_reset.to_csv(index=False).encode("utf-8")
+            st.success(f"Données téléchargées pour {ticker}.")
+            st.download_button(
+                label="Télécharger le CSV",
+                data=csv_bytes,
+                file_name=f"{ticker}_data.csv",
+                mime="text/csv",
+            )
+            st.dataframe(data_reset.tail(10))
+
+    if plot_requested:
+        try:
+            data_frame = get_option_surface_from_yf(ticker, expiry)
         except Exception as exc:
-            st.error(f"Erreur de lecture du CSV: {exc}")
+            st.error(f"Erreur lors de la récupération des options yfinance: {exc}")
             return
 
         required_cols = {"K", "T", "iv"}
@@ -297,56 +403,59 @@ def ui_basket_surface():
             st.error(f"Colonnes manquantes dans le CSV: {missing}")
             return
 
-        if st.button("Tracer la surface IV"):
-            try:
-                k_grid, t_grid, iv_grid = build_grid(
-                    data_frame,
-                    spot=spot,
-                    n_k=int(grid_k),
-                    n_t=int(grid_t),
-                    k_span=k_span,
-                    t_min=0.0,
-                    t_max=max_maturity,
-                )
-                fig = make_iv_surface_figure(
-                    k_grid,
-                    t_grid,
-                    iv_grid,
-                    title_suffix=f" (S0={spot})",
-                )
-                st.pyplot(fig)
-            except Exception as exc:
-                st.error(f"Erreur lors de la construction de la surface: {exc}")
+        try:
+            k_grid, t_grid, iv_grid = build_grid(
+                data_frame,
+                spot=spot,
+                n_k=int(grid_k),
+                n_t=int(grid_t),
+                k_span=k_span,
+                t_min=0.0,
+                t_max=max_maturity,
+            )
+            fig = make_iv_surface_figure(
+                k_grid,
+                t_grid,
+                iv_grid,
+                title_suffix=f" (S0={spot})",
+            )
+            st.pyplot(fig)
+        except Exception as exc:
+            st.error(f"Erreur lors de la construction de la surface: {exc}")
 
 
 def ui_asian_options():
     st.header("Options asiatiques (module Asian)")
 
-    col_model, col_type = st.columns(2)
-    with col_model:
+    with st.sidebar:
+        st.subheader("Paramètres Asian")
+        ticker = st.text_input("Ticker Yahoo Finance", value="AAPL", key="asian_ticker")
+        try:
+            spot_default, sigma_default, hist_tail = get_spot_and_hist_vol(
+                ticker, period="6mo", interval="1d"
+            )
+        except Exception:
+            spot_default, sigma_default, hist_tail = 57830.0, 0.05, pd.DataFrame()
         model = st.selectbox(
             "Schéma binomial",
             ["BTM naïf", "Hull-White (HW_BTM)"],
+            key="asian_model",
         )
-    with col_type:
-        option_label = st.selectbox("Type d'option", ["Call", "Put"])
+        option_label = st.selectbox("Type d'option", ["Call", "Put"], key="asian_option_label")
+        strike_type_label = st.selectbox(
+            "Type de strike asiatique", ["fixed", "floating"], key="asian_strike_type"
+        )
 
-    strike_type_label = st.selectbox("Type de strike asiatique", ["fixed", "floating"])
+        spot = st.number_input("Spot S0 (auto yfinance)", value=spot_default, min_value=0.01, key="asian_spot")
+        strike = st.number_input("Strike K", value=spot_default, min_value=0.01, key="asian_strike")
+        rate = st.number_input("Taux sans risque r", value=0.01, key="asian_rate")
 
-    col_spot, col_strike, col_rate = st.columns(3)
-    with col_spot:
-        spot = st.number_input("Spot S0", value=57830.0, min_value=0.01)
-    with col_strike:
-        strike = st.number_input("Strike K", value=58000.0, min_value=0.01)
-    with col_rate:
-        rate = st.number_input("Taux sans risque r", value=0.01)
-
-    col_sigma, col_maturity, col_steps = st.columns(3)
-    with col_sigma:
-        sigma = st.number_input("Volatilité σ", value=0.05, min_value=0.0001)
-    with col_maturity:
-        maturity = st.number_input("Maturité T (années)", value=1.0, min_value=0.01)
-    with col_steps:
+        sigma = st.number_input(
+            "Volatilité σ (hist. yfinance)", value=sigma_default, min_value=0.0001, key="asian_sigma"
+        )
+        maturity = st.number_input(
+            "Maturité T (années)", value=1.0, min_value=0.01, key="asian_maturity"
+        )
         max_steps = 15 if model == "BTM naïf" else 60
         steps = st.number_input(
             "Nombre de pas N",
@@ -354,21 +463,32 @@ def ui_asian_options():
             min_value=1,
             max_value=max_steps,
             step=1,
+            key="asian_steps",
         )
 
-    m_points = None
-    if model == "Hull-White (HW_BTM)":
-        m_points = st.number_input(
-            "Nombre de points de moyenne M",
-            value=10,
-            min_value=2,
-            max_value=200,
-            step=1,
+        m_points = None
+        if model == "Hull-White (HW_BTM)":
+            m_points = st.number_input(
+                "Nombre de points de moyenne M",
+                value=10,
+                min_value=2,
+                max_value=200,
+                step=1,
+                key="asian_m_points",
+            )
+
+        show_bs = st.checkbox(
+            "Afficher le prix européen Black-Scholes correspondant",
+            value=True,
+            key="asian_show_bs",
         )
+        compute_requested = st.button("Calculer le prix asiatique", key="asian_compute")
 
-    show_bs = st.checkbox("Afficher le prix européen Black-Scholes correspondant", value=True)
+    if hist_tail is not None and not hist_tail.empty:
+        st.caption("Aperçu des dernières observations de clôture (yfinance)")
+        st.dataframe(hist_tail)
 
-    if st.button("Calculer le prix asiatique"):
+    if compute_requested:
         option_type = "C" if option_label == "Call" else "P"
         with st.spinner("Calcul en cours..."):
             try:
@@ -422,17 +542,13 @@ def main():
     st.set_page_config(page_title="Basket + Asian", layout="wide")
     st.title("Application Streamlit : Basket + Asian")
 
-    section = st.sidebar.radio(
-        "Choisissez un module",
-        ["Surface IV (Basket)", "Options asiatiques"],
-    )
+    tab_basket, tab_asian = st.tabs(["Surface IV (Basket)", "Options asiatiques"])
 
-    if section == "Surface IV (Basket)":
+    with tab_basket:
         ui_basket_surface()
-    else:
+    with tab_asian:
         ui_asian_options()
 
 
 if __name__ == "__main__":
     main()
-
