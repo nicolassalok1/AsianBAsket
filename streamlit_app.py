@@ -611,10 +611,12 @@ def ui_basket_surface(spot_common, maturity_common, rate_common, strike_common):
 
     st.caption("Le calcul de corrélation utilise les prix de clôture ajustés téléchargés via yfinance. En cas d'échec, une matrice de corrélation inventée sera utilisée.")
     # Génère closing_prices.csv via le script dédié (avec les tickers saisis)
+    regen_csv = st.button("Regénérer closing_prices.csv", key="btn_regen_closing")
     try:
-        cmd = [sys.executable, "fetch_closing_prices.py", "--tickers", *tickers, "--output", "closing_prices.csv"]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        st.info(f"closing_prices.csv généré via le script ({res.stdout.strip()})")
+        if regen_csv or not Path("closing_prices.csv").exists():
+            cmd = [sys.executable, "fetch_closing_prices.py", "--tickers", *tickers, "--output", "closing_prices.csv"]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            st.info(f"closing_prices.csv généré via le script ({res.stdout.strip()})")
     except Exception as exc:
         st.warning(f"Impossible d'exécuter fetch_closing_prices.py : {exc}")
 
@@ -686,7 +688,7 @@ def ui_basket_surface(spot_common, maturity_common, rate_common, strike_common):
             if "val_loss" in logs or "val_mean_squared_error" in logs:
                 msg += f" - val_loss: {logs.get('val_loss', float('nan')):.4f} - val_mse: {logs.get('val_mean_squared_error', float('nan')):.4f}"
             train_logs.append(msg)
-            log_box.text("\\n".join(train_logs))
+            log_box.text("\n".join(train_logs))
 
     with st.spinner("Entraînement du NN en cours…"):
         history = model.fit(
