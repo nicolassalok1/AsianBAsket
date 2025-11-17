@@ -5,6 +5,10 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.stats import norm
 import streamlit as st
 import yfinance as yf
+import io
+import tensorflow as tf
+import os
+from pathlib import Path
 
 
 @st.cache_data(show_spinner=False)
@@ -46,17 +50,230 @@ def get_spot_and_hist_vol(ticker: str, period: str = "6mo", interval: str = "1d"
     return spot, sigma, hist_df
 
 
+def fetch_closing_prices(tickers, period="1mo", interval="1d"):
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    # Nettoie les variables d'impersonation problématiques
+    for var in ["YF_IMPERSONATE", "YF_SCRAPER_IMPERSONATE"]:
+        try:
+            os.environ.pop(var, None)
+        except Exception:
+            pass
+    try:
+        yf.set_config(proxy=None)
+    except Exception:
+        pass
+
+    data = yf.download(
+        tickers=tickers,
+        period=period,
+        interval=interval,
+        auto_adjust=True,
+        progress=False,
+    )
+    if data.empty:
+        raise RuntimeError(f"Aucune donnée récupérée pour {tickers} sur {period}.")
+
+    if isinstance(data.columns, pd.MultiIndex):
+        prices = data["Adj Close"] if "Adj Close" in data.columns.levels[0] else data["Close"]
+    else:
+        if "Adj Close" in data.columns:
+            prices = data[["Adj Close"]].copy()
+        elif "Close" in data.columns:
+            prices = data[["Close"]].copy()
+        else:
+            raise RuntimeError("Colonnes de prix introuvables dans les données yfinance.")
+        prices.columns = tickers
+
+    prices = prices.reset_index()
+    return prices
+
+
+def compute_corr_from_prices(prices_df: pd.DataFrame):
+    price_cols = [c for c in prices_df.columns if c.lower() != "date"]
+    returns = np.log(prices_df[price_cols] / prices_df[price_cols].shift(1)).dropna(how="any")
+    if returns.empty:
+        raise RuntimeError("Pas assez de données pour calculer la corrélation.")
+    return returns.corr()
+
+
+def compute_corr_from_yfinance(tickers, period: str = "1mo", interval: str = "1d", fallback: pd.DataFrame | None = None):
+    """
+    Calcule une matrice de corrélation à partir des prix téléchargés via yfinance.
+
+    - tickers: liste de tickers ou ticker unique (str)
+    - period : fenêtre temporelle (ex: '1mo', '3mo')
+    - interval: intervalle des données (ex: '1d', '1h')
+    - fallback: DataFrame de corrélation à utiliser si le téléchargement échoue ou si les données sont vides
+    """
+    if isinstance(tickers, str):
+        tickers = [tickers]
+
+    # Nettoie les variables d'impersonation problématiques
+    for var in ["YF_IMPERSONATE", "YF_SCRAPER_IMPERSONATE"]:
+        try:
+            os.environ.pop(var, None)
+        except Exception:
+            pass
+    try:
+        yf.set_config(proxy=None)
+    except Exception:
+        pass
+
+    try:
+        data = yf.download(
+            tickers=tickers,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        if fallback is not None:
+            return fallback
+        raise
+
+    if data.empty:
+        if fallback is not None:
+            return fallback
+        raise RuntimeError("Aucune donnée de prix récupérée via yfinance pour les tickers fournis.")
+
+    if isinstance(data.columns, pd.MultiIndex):
+        prices = data["Adj Close"] if "Adj Close" in data.columns.levels[0] else data["Close"]
+    else:
+        if "Adj Close" in data.columns:
+            prices = data[["Adj Close"]].copy()
+        elif "Close" in data.columns:
+            prices = data[["Close"]].copy()
+        else:
+            if fallback is not None:
+                return fallback
+            raise RuntimeError("Colonnes de prix introuvables dans les données yfinance.")
+        prices.columns = tickers
+
+    returns = np.log(prices / prices.shift(1)).dropna(how="any")
+    if returns.empty:
+        if fallback is not None:
+            return fallback
+        raise RuntimeError("Pas assez de données de rendements pour calculer la corrélation.")
+
+    return returns.corr()
+
+
+@st.cache_data(show_spinner=False)
+def load_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(file_bytes))
+
+
+def split_data_nn(data: pd.DataFrame, split_ratio: float = 0.7):
+    feature_cols = ["S/K", "Maturity", "Volatility", "Rate"]
+    target_col = "Labels"
+    train = data.iloc[: int(split_ratio * len(data)), :]
+    test = data.iloc[int(split_ratio * len(data)) :, :]
+    x_train, y_train = train[feature_cols], train[target_col]
+    x_test, y_test = test[feature_cols], test[target_col]
+    return x_train, y_train, x_test, y_test
+
+
+def build_model_nn(input_dim: int) -> tf.keras.Model:
+    inp = tf.keras.layers.Input(shape=(input_dim,))
+    x = tf.keras.layers.Dense(32, activation="relu")(inp)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    out = tf.keras.layers.Dense(1, activation="relu")(x)
+    model = tf.keras.Model(inputs=inp, outputs=out)
+    model.compile(
+        loss="mean_squared_error",
+        optimizer="adam",
+        metrics=["mean_squared_error"],
+    )
+    return model
+
+
+def price_basket_nn(model: tf.keras.Model, S: float, K: float, maturity: float, volatility: float, rate: float) -> float:
+    S_over_K = S / K
+    x = np.array([[S_over_K, maturity, volatility, rate]], dtype=float)
+    return float(model.predict(x, verbose=0)[0, 0])
+
+
+def plot_heatmap_nn(model: tf.keras.Model, data: pd.DataFrame):
+    m_min, m_max = data["S/K"].quantile([0.01, 0.99])
+    t_min, t_max = data["Maturity"].quantile([0.01, 0.99])
+    n_S, n_T = 50, 50
+    m_vals = np.linspace(m_min, m_max, n_S)
+    t_vals = np.linspace(t_min, t_max, n_T)
+    M_grid, T_grid = np.meshgrid(m_vals, t_vals)
+
+    sigma_ref = float(data["Volatility"].median())
+    rate_ref = float(data["Rate"].median())
+
+    X = np.stack(
+        [
+            M_grid.ravel(),
+            T_grid.ravel(),
+            np.full(M_grid.size, sigma_ref),
+            np.full(M_grid.size, rate_ref),
+        ],
+        axis=1,
+    )
+    prices_grid = model.predict(X, verbose=0).reshape(n_T, n_S)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    im = ax.imshow(
+        prices_grid,
+        origin="lower",
+        extent=[m_vals.min(), m_vals.max(), t_vals.min(), t_vals.max()],
+        aspect="auto",
+        cmap="viridis",
+    )
+    ax.set_xlabel("Moneyness S/K")
+    ax.set_ylabel("Maturity T (years)")
+    ax.set_title("Heatmap prix NN (S/K vs T)")
+    fig.colorbar(im, ax=ax, label="Prix NN")
+    plt.tight_layout()
+    return fig
+
+
 def build_grid(
     df: pd.DataFrame,
     spot: float,
     n_k: int = 200,
     n_t: int = 200,
-    k_span: float = 100.0,
-    t_min: float = 0.0,
-    t_max: float = 2.0,
+    k_min: float | None = None,
+    k_max: float | None = None,
+    t_min: float | None = None,
+    t_max: float | None = None,
+    k_span: float | None = None,
+    margin_frac: float = 0.02,
 ):
-    k_min = spot - k_span
-    k_max = spot + k_span
+    """
+    Construit une grille régulière (K, T) en s'inspirant du notebook :
+    - si k_min/k_max ne sont pas fournis, on utilise les bornes des données avec une marge
+    - si k_span est donné, on force une fenêtre centrée sur le spot
+    - les bornes en maturité suivent le dataset par défaut
+    """
+    if k_min is None or k_max is None:
+        if k_span is not None:
+            k_min = spot - k_span
+            k_max = spot + k_span
+        else:
+            data_k_min = float(df["K"].min())
+            data_k_max = float(df["K"].max())
+            delta_k = data_k_max - data_k_min
+            pad = delta_k * margin_frac
+            k_min = data_k_min - pad
+            k_max = data_k_max + pad
+
+    if t_min is None:
+        t_min = float(df["T"].min())
+    if t_max is None:
+        t_max = float(df["T"].max())
+
+    if k_min >= k_max:
+        raise ValueError("k_min doit être inférieur à k_max.")
+    if t_min >= t_max:
+        raise ValueError("t_min doit être inférieur à t_max.")
 
     k_vals = np.linspace(k_min, k_max, n_k)
     t_vals = np.linspace(t_min, t_max, n_t)
@@ -68,16 +285,12 @@ def build_grid(
     if df.empty:
         raise ValueError("Aucun point dans le domaine de la grille après filtrage.")
 
-    df["K_idx"] = np.searchsorted(k_vals, df["K"], side="left")
-    df["T_idx"] = np.searchsorted(t_vals, df["T"], side="left")
-
-    df["K_idx"] = df["K_idx"].clip(0, n_k - 1)
-    df["T_idx"] = df["T_idx"].clip(0, n_t - 1)
+    df["K_idx"] = np.searchsorted(k_vals, df["K"], side="left").clip(0, n_k - 1)
+    df["T_idx"] = np.searchsorted(t_vals, df["T"], side="left").clip(0, n_t - 1)
 
     grouped = df.groupby(["T_idx", "K_idx"])["iv"].mean().reset_index()
 
     iv_grid = np.full((n_t, n_k), np.nan, dtype=float)
-
     for _, row in grouped.iterrows():
         ti = int(row["T_idx"])
         ki = int(row["K_idx"])
@@ -343,91 +556,132 @@ def compute_asian_price(
     )
 
 
-def ui_basket_surface(ticker, period, interval, spot_common, maturity_common, rate_common, hist_df):
-    st.header("Surface de volatilité implicite (module Basket)")
-    st.markdown(
-        "Les paramètres et actions sont disponibles dans la sidebar. "
-        "Le fichier CSV requis doit contenir les colonnes `K`, `T` et `iv`."
-    )
+def ui_basket_surface(spot_common, maturity_common, rate_common, strike_common):
+    st.header("Basket – Pricing NN + corrélation (3 actifs)")
 
-    if hist_df is None:
-        hist_df = pd.DataFrame()
+    # Saisie des tickers (corrélation)
+    col_tk = st.columns(3)
+    with col_tk[0]:
+        tk1 = st.text_input("Ticker 1", "AAPL", key="corr_tk1")
+    with col_tk[1]:
+        tk2 = st.text_input("Ticker 2", "SPY", key="corr_tk2")
+    with col_tk[2]:
+        tk3 = st.text_input("Ticker 3", "MSFT", key="corr_tk3")
+    period = st.selectbox("Période yfinance", ["1mo", "3mo", "6mo", "1y"], index=0, key="corr_period")
+    interval = st.selectbox("Intervalle", ["1d", "1h"], index=0, key="corr_interval")
+
+    st.caption("Le calcul de corrélation utilise les prix de clôture ajustés téléchargés via yfinance. En cas d'échec, une matrice de corrélation inventée sera utilisée.")
+    corr_df = None
+    try:
+        prices = fetch_closing_prices([tk1, tk2, tk3], period=period, interval=interval)
+        corr_df = compute_corr_from_prices(prices)
+        st.success("Corrélation calculée")
+        st.dataframe(corr_df)
+    except Exception as exc:
+        st.warning(f"Impossible de récupérer les données : {exc}")
+        corr_df = pd.DataFrame(
+            [
+                [1.0, 0.6, 0.4],
+                [0.6, 1.0, 0.7],
+                [0.4, 0.7, 1.0],
+            ],
+            columns=[tk1, tk2, tk3],
+            index=[tk1, tk2, tk3],
+        )
+        st.info("Utilisation d'une matrice de corrélation inventée pour la suite des calculs.")
+        st.dataframe(corr_df)
+
+    st.subheader("Dataset Basket pour NN")
+    default_path = Path("data/train.csv")
+    if not default_path.exists():
+        st.error("Fichier data/train.csv introuvable. Ajoute-le puis relance l'appli.")
+        return
+
+    df = pd.read_csv(default_path)
+    source = str(default_path)
+
+    st.write(f"Dataset chargé depuis : {source}")
+    st.write("Aperçu :", df.head())
+    st.write("Shape :", df.shape)
+
+    split_ratio = st.slider("Train ratio", 0.5, 0.9, 0.7, 0.05)
+    epochs = st.slider("Epochs d'entraînement", 5, 200, 20, 5)
+
+    x_train, y_train, x_test, y_test = split_data_nn(df, split_ratio=split_ratio)
+    Path("data").mkdir(parents=True, exist_ok=True)
+    pd.concat([x_train, y_train], axis=1).to_csv("data/train.csv", index=False)
+    pd.concat([x_test, y_test], axis=1).to_csv("data/test.csv", index=False)
+    st.info("train.csv et test.csv régénérés pour la surface IV.")
+
+    st.write(f"Train size: {x_train.shape[0]} | Test size: {x_test.shape[0]}")
+
+    model = build_model_nn(input_dim=x_train.shape[1])
+    history = model.fit(
+        x_train,
+        y_train,
+        epochs=epochs,
+        validation_data=(x_test, y_test),
+        verbose=0,
+    )
+    st.success("Entraînement terminé.")
 
     col1, col2 = st.columns(2)
     with col1:
-        st.info(f"Spot commun S0 = {spot_common:.4f}")
-        st.info(f"T commun = {maturity_common:.4f} années")
-        st.info(f"Taux sans risque commun r = {rate_common:.4f}")
-        k_span = st.number_input(
-            "Étendue en strike autour de S0",
-            value=100.0,
-            min_value=1.0,
-            key="basket_k_span",
-        )
+        st.subheader("Courbes MSE")
+        fig, ax = plt.subplots(figsize=(6, 3))
+        ax.plot(history.history["mean_squared_error"], label="train")
+        ax.plot(history.history["val_mean_squared_error"], label="val")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("MSE")
+        ax.legend()
+        ax.grid(True, linestyle="--", alpha=0.4)
+        st.pyplot(fig)
+
     with col2:
-        grid_k = st.number_input(
-            "Points de grille en K",
-            value=100,
-            min_value=20,
-            max_value=400,
-            step=10,
-            key="basket_grid_k",
-        )
-        grid_t = st.number_input(
-            "Points de grille en T",
-            value=100,
-            min_value=20,
-            max_value=400,
-            step=10,
-            key="basket_grid_t",
-        )
+        st.subheader("Heatmap S/K vs T (prix NN)")
+        heatmap_fig = plot_heatmap_nn(model, df)
+        st.pyplot(heatmap_fig)
 
-    option_surface = None
-    expiries = get_option_expiries(ticker)
-    if expiries:
-        try:
-            # Choix de l'échéance dont la date est la plus proche de T commun
-            expiry_dates = [pd.to_datetime(e).date() for e in expiries]
-            target_date = (
-                pd.Timestamp.utcnow() + pd.to_timedelta(maturity_common * 365.0, unit="D")
-            ).date()
-            idx_min = int(np.argmin([abs((d - target_date).days) for d in expiry_dates]))
-            expiry_chosen = expiries[idx_min]
-            option_surface = get_option_surface_from_yf(ticker, expiry_chosen)
-            # On force la colonne T à la maturité commune
-            option_surface["T"] = float(maturity_common)
-        except Exception as exc:
-            st.error(f"Erreur lors de la récupération des options yfinance: {exc}")
+    st.subheader("Surface IV (Strike, Maturité)")
+    try:
+        iv_df = df.copy()
+        iv_df["K"] = spot_common / iv_df["S/K"].replace(0.0, np.nan)
+        iv_df = iv_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["K", "Maturity", "Volatility"])
 
-    if option_surface is not None and not option_surface.empty:
-        st.subheader("Surface IV (données options yfinance)")
-        st.caption(
-            f"Échantillon: {len(option_surface)} lignes, ticker {ticker}, T commun = {maturity_common:.4f} ans"
+        if iv_df.empty:
+            raise ValueError("Pas de données IV exploitables (S/K nuls ou manquants).")
+
+        grid_k, grid_t, grid_iv = build_grid(
+            df=iv_df.rename(columns={"Maturity": "T", "Volatility": "iv"}),
+            spot=float(spot_common),
         )
-        required_cols = {"K", "T", "iv"}
-        if not required_cols.issubset(option_surface.columns):
-            missing = required_cols - set(option_surface.columns)
-            st.error(f"Colonnes manquantes dans la surface: {missing}")
-            return
-        try:
-            k_grid, t_grid, iv_grid = build_grid(
-                option_surface,
-                spot=spot_common,
-                n_k=int(grid_k),
-                n_t=int(grid_t),
-                k_span=k_span,
-                t_min=0.0,
-                t_max=maturity_common,
-            )
-            fig = make_iv_surface_figure(
-                k_grid,
-                t_grid,
-                iv_grid,
-                title_suffix=f" (S0={spot_common})",
-            )
-            st.pyplot(fig)
-        except Exception as exc:
-            st.error(f"Erreur lors de la construction de la surface: {exc}")
+        iv_fig = make_iv_surface_figure(grid_k, grid_t, grid_iv, title_suffix=" (dataset NN)")
+        st.pyplot(iv_fig)
+    except Exception as exc:
+        st.warning(f"Impossible d'afficher la surface IV : {exc}")
+
+    st.subheader("Pricing interactif (S, K, T depuis la sidebar)")
+    with st.form("pricing_form_basket_nn_main"):
+        sigma = st.number_input(
+            "Volatilité σ",
+            value=float(df["Volatility"].median()),
+            min_value=0.0001,
+            key="price_sigma_nn",
+        )
+        rate = st.number_input("Rate r", value=rate_common, key="price_rate_nn")
+        submitted = st.form_submit_button("Calculer le prix NN")
+    if submitted:
+        price_nn = price_basket_nn(
+            model,
+            S=spot_common,
+            K=strike_common,
+            maturity=maturity_common,
+            volatility=sigma,
+            rate=rate,
+        )
+        st.info(
+            f"Prix NN (S0={spot_common}, K={strike_common}, T={maturity_common}): {price_nn:.6f}"
+        )
 
 
 def _render_asian_heatmaps_for_model(
@@ -695,17 +949,14 @@ def main():
         st.subheader("Courbe des prix de clôture (yfinance)")
         st.line_chart(hist_df.set_index("Date")["Close"])
 
-    tab_basket, tab_asian = st.tabs(["Surface IV (Basket)", "Options asiatiques"])
+    tab_basket, tab_asian = st.tabs(["Basket (NN pricing)", "Options asiatiques"])
 
     with tab_basket:
         ui_basket_surface(
-            ticker=ticker,
-            period=period,
-            interval=interval,
             spot_common=spot_common,
             maturity_common=maturity_common,
             rate_common=rate_common,
-            hist_df=hist_df,
+            strike_common=strike_common,
         )
     with tab_asian:
         ui_asian_options(
