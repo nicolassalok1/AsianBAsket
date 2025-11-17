@@ -959,7 +959,7 @@ def main():
 
     with st.sidebar:
         st.subheader("Recherche yfinance (commune Basket/Asian)")
-        ticker = st.text_input("Ticker", value="AAPL", key="common_ticker")
+        ticker = st.text_input("Ticker", value="", key="common_ticker", placeholder="Ex: AAPL")
         # Période et intervalle de prix fixés
         period = "2y"
         interval = "1d"
@@ -995,8 +995,18 @@ def main():
                 if not opt_csv.empty:
                     if "S0" in opt_csv.columns:
                         spot_from_csv = float(opt_csv["S0"].median())
+                        st.session_state["common_spot"] = spot_from_csv
+                        st.session_state["common_strike"] = spot_from_csv  # K = S0
                     if "iv" in opt_csv.columns:
-                        sigma_from_csv = float(opt_csv["iv"].median(skipna=True))
+                        maturity_target = st.session_state.get("common_maturity", 1.0)
+                        calls = opt_csv[opt_csv.get("option_type") == "Call"] if "option_type" in opt_csv.columns else opt_csv
+                        if "T" in calls.columns and not calls.empty:
+                            calls = calls.copy()
+                            calls["abs_diff_T"] = (calls["T"] - maturity_target).abs()
+                            best = calls.sort_values("abs_diff_T").iloc[0]
+                            sigma_from_csv = float(best["iv"]) if pd.notna(best["iv"]) else None
+                        else:
+                            sigma_from_csv = float(opt_csv["iv"].median(skipna=True))
             except Exception:
                 pass
 
