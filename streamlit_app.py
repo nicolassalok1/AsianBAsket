@@ -629,7 +629,7 @@ def ui_basket_surface(spot_common, maturity_common, rate_common, strike_common):
     period = st.selectbox("Période yfinance", ["1mo", "3mo", "6mo", "1y"], index=0, key="corr_period")
     interval = st.selectbox("Intervalle", ["1d", "1h"], index=0, key="corr_interval")
 
-    st.caption("Le calcul de corrélation utilise les prix de clôture ajustés téléchargés via yfinance. En cas d'échec, une matrice de corrélation inventée sera utilisée.")
+    st.caption("Le calcul de corrélation utilise les prix de clôture présents dans closing_prices.csv (générés via le script). En cas d'échec, une matrice de corrélation inventée sera utilisée.")
     # Génère closing_prices.csv via le script dédié (avec les tickers saisis)
     regen_csv = st.button("Regénérer closing_prices.csv", key="btn_regen_closing")
     try:
@@ -963,35 +963,44 @@ def main():
         # Période et intervalle de prix fixés
         period = "2y"
         interval = "1d"
-        fetch_data = st.button("Télécharger / actualiser les données yfinance", key="common_download")
+        fetch_data = st.button("Télécharger / actualiser les données (scripts)", key="common_download")
 
-        # Téléchargement yfinance, au premier affichage, au changement de ticker,
-        # ou quand l'utilisateur clique sur le bouton.
-        yf_key = st.session_state.get("yf_key")
-        curr_key = (ticker, period, interval)
-        should_fetch = fetch_data or yf_key is None or yf_key != curr_key
+        # Essaye de renseigner S0 / iv depuis ticker_prices.csv (options)
+        spot_from_csv = None
+        sigma_from_csv = None
+        try:
+            opt_csv = pd.read_csv("ticker_prices.csv")
+            if not opt_csv.empty:
+                if "S0" in opt_csv.columns:
+                    spot_from_csv = float(opt_csv["S0"].median())
+                if "iv" in opt_csv.columns:
+                    sigma_from_csv = float(opt_csv["iv"].median(skipna=True))
+        except Exception:
+            pass
 
-        if should_fetch:
+        # Rafraîchissement uniquement via les scripts (optionnel)
+        if fetch_data:
             try:
-                spot_yf, sigma_yf, hist_yf = get_spot_and_hist_vol(
-                    ticker, period=period, interval=interval
+                subprocess.run(
+                    [sys.executable, "build_option_prices_csv.py", ticker, "--output", "ticker_prices.csv"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
                 )
-                st.session_state["yf_key"] = curr_key
-                st.session_state["yf_spot"] = float(spot_yf)
-                st.session_state["yf_sigma"] = float(sigma_yf)
-                st.session_state["yf_hist_df"] = hist_yf
-
-                # Met à jour automatiquement les bornes S0/K des heatmaps asiatiques (+/- 20)
-                s_center = float(st.session_state.get("common_spot", spot_yf))
-                k_center = float(st.session_state.get("common_strike", spot_yf))
-                st.session_state["asian_s_min"] = max(0.01, s_center - 20.0)
-                st.session_state["asian_s_max"] = s_center + 20.0
-                st.session_state["asian_k_min"] = max(0.01, k_center - 20.0)
-                st.session_state["asian_k_max"] = k_center + 20.0
             except Exception as exc:
-                st.warning(f"Impossible de récupérer les prix pour {ticker}: {exc}")
+                st.warning(f"Impossible d'exécuter build_option_prices_csv.py : {exc}")
+            # Recharge les placeholders depuis le CSV fraîchement généré
+            try:
+                opt_csv = pd.read_csv("ticker_prices.csv")
+                if not opt_csv.empty:
+                    if "S0" in opt_csv.columns:
+                        spot_from_csv = float(opt_csv["S0"].median())
+                    if "iv" in opt_csv.columns:
+                        sigma_from_csv = float(opt_csv["iv"].median(skipna=True))
+            except Exception:
+                pass
 
-        spot_seed = st.session_state.get("common_spot", st.session_state.get("yf_spot", 100.0))
+        spot_seed = spot_from_csv if spot_from_csv is not None else st.session_state.get("common_spot", 100.0)
         spot_common = st.number_input(
             "Spot commun S0 (pris pour les deux onglets)",
             value=spot_seed,
@@ -1004,7 +1013,7 @@ def main():
             min_value=0.01,
             key="common_maturity",
         )
-        strike_seed = st.session_state.get("common_strike", st.session_state.get("yf_spot", 100.0))
+        strike_seed = spot_seed  # K déduit égal à S0
         strike_common = st.number_input(
             "Strike commun K (utilisé partout)",
             value=strike_seed,
@@ -1018,25 +1027,17 @@ def main():
             format="%.4f",
             key="common_rate",
         )
-        sigma_seed = st.session_state.get("yf_sigma", 0.2)
+        sigma_seed = sigma_from_csv if sigma_from_csv is not None else 0.2
         sigma_common = st.number_input(
             "Volatilité commune σ",
             value=float(sigma_seed),
             min_value=0.0001,
             key="common_sigma",
         )
-    # Récupère les données yfinance mises en cache dans la session
-    hist_df = st.session_state.get("yf_hist_df", pd.DataFrame())
-    spot_default = st.session_state.get("yf_spot", spot_common)
-    sigma_default = st.session_state.get("yf_sigma", None)
-    sigma_common = st.session_state.get(
-        "common_sigma",
-        sigma_default if sigma_default is not None else 0.2,
-    )
-
-    if not hist_df.empty:
-        st.subheader("Courbe des prix de clôture (yfinance)")
-        st.line_chart(hist_df.set_index("Date")["Close"])
+    # Pas de cache yfinance : on se base uniquement sur les CSV générés par les scripts
+    hist_df = pd.DataFrame()
+    spot_default = spot_common
+    sigma_common = st.session_state.get("common_sigma", sigma_common)
 
     tab_basket, tab_asian = st.tabs(["Basket (NN pricing)", "Options asiatiques"])
 
