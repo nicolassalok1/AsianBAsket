@@ -384,10 +384,36 @@ def make_iv_surface_figure(k_grid, t_grid, iv_grid, title_suffix=""):
 
 
 def btm_asian(strike_type, option_type, spot, strike, rate, sigma, maturity, steps):
+    """
+    Prix d'une option asiatique par arbre binomial naïf (BTM).
+    
+    Cette méthode construit un arbre binomial complet et calcule la moyenne arithmétique
+    des prix du sous-jacent à chaque nœud terminal. La complexité est exponentielle O(2^N).
+    
+    Args:
+        strike_type: "fixed" (strike fixe K) ou "floating" (strike = moyenne A_T)
+        option_type: "C" (call) ou "P" (put)
+        spot: Prix spot initial S_0
+        strike: Prix d'exercice K (utilisé seulement si strike_type="fixed")
+        rate: Taux sans risque r
+        sigma: Volatilité σ
+        maturity: Maturité T (en années)
+        steps: Nombre de pas N dans l'arbre binomial
+    
+    Returns:
+        Prix de l'option asiatique
+    
+    Note:
+        - Call fixe: max(A_T - K, 0) où A_T = moyenne arithmétique des prix
+        - Put fixe: max(K - A_T, 0)
+        - Call flottant: max(S_T - A_T, 0)
+        - Put flottant: max(A_T - S_T, 0)
+    """
     delta_t = maturity / steps
     up = np.exp(sigma * np.sqrt(delta_t))
     down = 1.0 / up
     prob = (np.exp(rate * delta_t) - down) / (up - down)
+    discount = np.exp(-rate * delta_t)
 
     spot_paths = [spot]
     avg_paths = [spot]
@@ -415,15 +441,45 @@ def btm_asian(strike_type, option_type, spot, strike, rate, sigma, maturity, ste
         else:
             payoff = np.maximum(avg_paths - spot_paths, 0.0)
 
+    # Récursion arrière avec actualisation à chaque pas
     option_price = payoff.copy()
     for _ in range(steps):
         length = len(option_price) // 2
-        option_price = prob * option_price[:length] + (1 - prob) * option_price[length:]
+        option_price = discount * (prob * option_price[:length] + (1 - prob) * option_price[length:])
 
     return float(option_price[0])
 
 
 def hw_btm_asian(strike_type, option_type, spot, strike, rate, sigma, maturity, steps, m_points):
+    """
+    Prix d'une option asiatique par la méthode de Hull-White (arbre binomial optimisé).
+    
+    Cette méthode utilise une grille bidimensionnelle (étape temporelle, valeur moyenne) pour
+    représenter l'état de l'option. À chaque nœud, on discrétise les valeurs possibles de la
+    moyenne arithmétique en m_points. L'interpolation linéaire est utilisée pour la récursion
+    arrière. La complexité est réduite à O(N^2 * M) où N=steps et M=m_points.
+    
+    Référence: Hull, J.C. & White, A. (1993). "Efficient Procedures for Valuing European
+    and American Path-Dependent Options." Journal of Derivatives, 1(1), 21-31.
+    
+    Args:
+        strike_type: "fixed" (strike fixe K) ou "floating" (strike = moyenne A_T)
+        option_type: "C" (call) ou "P" (put)
+        spot: Prix spot initial S_0
+        strike: Prix d'exercice K (utilisé seulement si strike_type="fixed")
+        rate: Taux sans risque r
+        sigma: Volatilité σ
+        maturity: Maturité T (en années)
+        steps: Nombre de pas N dans l'arbre binomial
+        m_points: Nombre de points de discrétisation pour les valeurs moyennes
+    
+    Returns:
+        Prix de l'option asiatique
+    
+    Note:
+        - Plus m_points est élevé, plus la précision augmente, mais le temps de calcul aussi
+        - Typiquement m_points=10-50 donne un bon compromis précision/performance
+    """
     n_steps = steps
     delta_t = maturity / n_steps
     up = np.exp(sigma * np.sqrt(delta_t))
@@ -842,6 +898,15 @@ def ui_asian_options(
     rate_common,
 ):
     st.header("Options asiatiques (module Asian)")
+    
+    # Avertissement important sur les limitations
+    st.warning("""
+    ⚠️ **Avertissements Importants**:
+    - **BTM naïf**: Utilisez N ≤ 15 (risque de manque de mémoire au-delà)
+    - **Hull-White**: ⛔ BUG CRITIQUE - Ne produit des résultats corrects que pour N=2. 
+      Erreurs de +50% à +100% pour N > 2. À éviter pour le moment.
+    - Voir `ASIAN_OPTIONS_ANALYSIS.md` pour les détails techniques.
+    """)
 
     if spot_default is None:
         st.warning("Aucun téléchargement yfinance : utilisez le spot commun.")
@@ -867,10 +932,14 @@ def ui_asian_options(
             "Nombre de pas N",
             value=10,
             min_value=1,
-            max_value=60,
+            max_value=20,  # Réduit de 60 à 20 pour éviter les problèmes
             step=1,
             key="asian_steps",
         )
+        
+        # Avertissement si N > 15
+        if steps > 15:
+            st.error(f"⚠️ N={steps} peut causer des problèmes de mémoire avec BTM naïf! Recommandation: N ≤ 15")
 
     st.subheader("Heatmaps prix asiatique (S0 vs K)")
     col_s, col_k = st.columns(2)
@@ -916,9 +985,17 @@ def ui_asian_options(
     s_vals = np.arange(s_min, s_max + 1.0, 1.0, dtype=float)
     k_vals = np.arange(k_min, k_max + 1.0, 1.0, dtype=float)
 
-    tab_btm, tab_hw = st.tabs(["BTM naïf", "Hull-White (HW_BTM)"])
+    tab_btm, tab_hw = st.tabs(["BTM naïf ✓", "Hull-White ⚠️ BUGUÉ"])
 
     with tab_btm:
+        st.info("""
+        **BTM Naïf (Binomial Tree Method)**:
+        - ✅ Résultats fiables et corrects
+        - ✅ Corrigé: facteur d'actualisation appliqué
+        - ⚠️ Limitation: N ≤ 15 recommandé (complexité exponentielle O(2^N))
+        - 📊 Complexité mémoire: 2^N nœuds terminaux
+        """)
+        
         _render_asian_heatmaps_for_model(
             model="BTM naïf",
             s_vals=s_vals,
@@ -932,6 +1009,16 @@ def ui_asian_options(
         )
 
     with tab_hw:
+        st.error("""
+        ⛔ **AVERTISSEMENT CRITIQUE - BUG DANS L'IMPLÉMENTATION**:
+        - ❌ L'algorithme Hull-White actuel contient un bug majeur
+        - ❌ Produit des résultats incorrects pour N > 2
+        - ❌ Erreurs de +50% à +100% observées
+        - 🔍 Problème: Extrapolation au lieu d'interpolation dans l'induction arrière
+        - 🚫 **NE PAS UTILISER** ces résultats pour des décisions réelles
+        - 📝 Voir ASIAN_OPTIONS_ANALYSIS.md pour les détails techniques
+        """)
+        
         m_points = st.number_input(
             "Nombre de points de moyenne M (Hull-White)",
             value=10,
@@ -940,6 +1027,9 @@ def ui_asian_options(
             step=1,
             key="asian_m_points_hw",
         )
+        
+        st.caption("⚠️ Résultats affichés à titre de démonstration uniquement - NON FIABLES")
+        
         _render_asian_heatmaps_for_model(
             model="Hull-White (HW_BTM)",
             s_vals=s_vals,
