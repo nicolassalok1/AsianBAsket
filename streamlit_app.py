@@ -898,6 +898,15 @@ def ui_asian_options(
     rate_common,
 ):
     st.header("Options asiatiques (module Asian)")
+    
+    # Avertissement important sur les limitations
+    st.warning("""
+    ⚠️ **Avertissements Importants**:
+    - **BTM naïf**: Utilisez N ≤ 15 (risque de manque de mémoire au-delà)
+    - **Hull-White**: ⛔ BUG CRITIQUE - Ne produit des résultats corrects que pour N=2. 
+      Erreurs de +50% à +100% pour N > 2. À éviter pour le moment.
+    - Voir `ASIAN_OPTIONS_ANALYSIS.md` pour les détails techniques.
+    """)
 
     if spot_default is None:
         st.warning("Aucun téléchargement yfinance : utilisez le spot commun.")
@@ -923,10 +932,14 @@ def ui_asian_options(
             "Nombre de pas N",
             value=10,
             min_value=1,
-            max_value=60,
+            max_value=20,  # Réduit de 60 à 20 pour éviter les problèmes
             step=1,
             key="asian_steps",
         )
+        
+        # Avertissement si N > 15
+        if steps > 15:
+            st.error(f"⚠️ N={steps} peut causer des problèmes de mémoire avec BTM naïf! Recommandation: N ≤ 15")
 
     st.subheader("Heatmaps prix asiatique (S0 vs K)")
     col_s, col_k = st.columns(2)
@@ -972,9 +985,17 @@ def ui_asian_options(
     s_vals = np.arange(s_min, s_max + 1.0, 1.0, dtype=float)
     k_vals = np.arange(k_min, k_max + 1.0, 1.0, dtype=float)
 
-    tab_btm, tab_hw = st.tabs(["BTM naïf", "Hull-White (HW_BTM)"])
+    tab_btm, tab_hw = st.tabs(["BTM naïf ✓", "Hull-White ⚠️ BUGUÉ"])
 
     with tab_btm:
+        st.info("""
+        **BTM Naïf (Binomial Tree Method)**:
+        - ✅ Résultats fiables et corrects
+        - ✅ Corrigé: facteur d'actualisation appliqué
+        - ⚠️ Limitation: N ≤ 15 recommandé (complexité exponentielle O(2^N))
+        - 📊 Complexité mémoire: 2^N nœuds terminaux
+        """)
+        
         _render_asian_heatmaps_for_model(
             model="BTM naïf",
             s_vals=s_vals,
@@ -988,6 +1009,16 @@ def ui_asian_options(
         )
 
     with tab_hw:
+        st.error("""
+        ⛔ **AVERTISSEMENT CRITIQUE - BUG DANS L'IMPLÉMENTATION**:
+        - ❌ L'algorithme Hull-White actuel contient un bug majeur
+        - ❌ Produit des résultats incorrects pour N > 2
+        - ❌ Erreurs de +50% à +100% observées
+        - 🔍 Problème: Extrapolation au lieu d'interpolation dans l'induction arrière
+        - 🚫 **NE PAS UTILISER** ces résultats pour des décisions réelles
+        - 📝 Voir ASIAN_OPTIONS_ANALYSIS.md pour les détails techniques
+        """)
+        
         m_points = st.number_input(
             "Nombre de points de moyenne M (Hull-White)",
             value=10,
@@ -996,6 +1027,9 @@ def ui_asian_options(
             step=1,
             key="asian_m_points_hw",
         )
+        
+        st.caption("⚠️ Résultats affichés à titre de démonstration uniquement - NON FIABLES")
+        
         _render_asian_heatmaps_for_model(
             model="Hull-White (HW_BTM)",
             s_vals=s_vals,

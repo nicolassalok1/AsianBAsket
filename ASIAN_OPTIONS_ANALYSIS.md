@@ -31,29 +31,34 @@ option_price = discount * (prob * option_price[:length] + (1 - prob) * option_pr
 
 **Recommandation**: Utiliser la méthode Hull-White pour N > 15, car elle a une complexité O(N² × M) où M est le nombre de points de discrétisation (typiquement 10-50).
 
-### 3. **Différences entre BTM Naïf et Hull-White**
+### 3. **BUG CRITIQUE: Implémentation Hull-White Défectueuse**
 
-Les deux méthodes produisent des résultats différents en raison de leurs approches:
+**Problème Identifié**: L'implémentation actuelle de Hull-White contient un bug majeur dans la construction de la grille de moyennes pendant l'induction arrière.
 
-**BTM Naïf**:
-- Évalue tous les chemins possibles (exact pour l'arbre binomial)
-- Coût: exponentiel en mémoire et temps
-- Précision: limitée par le nombre de pas (doit rester petit)
+**Détails Techniques**:
+- Lors de l'induction arrière, les valeurs moyennes au nœud courant (étape n) tombent souvent **en dehors** de l'intervalle des moyennes possibles aux nœuds enfants (étape n+1)
+- Cela force l'algorithme à **extrapoler** au lieu d'**interpoler**, ce qui produit des résultats incorrects
+- Le problème s'aggrave avec l'augmentation du nombre de pas N
 
-**Hull-White**:
-- Utilise une grille (temps × moyenne) avec interpolation linéaire
-- Coût: polynomial O(N² × M)
-- Précision: dépend du nombre de points de discrétisation M
+**Exemple** (N=3, M=5):
+- Au nœud j=0, étape 2: moyenne = 112.74
+- Enfant "up" (j=0, étape 3): moyennes ∈ [119.90, 119.90] → extrapolation!
+- Enfant "down" (j=1, étape 3): moyennes ∈ [100.33, 112.61] → extrapolation!
 
-**Résultats Comparatifs** (S₀=100, K=100, r=5%, σ=20%, T=1 an, N=10):
-| Type | BTM Naïf | Hull-White (M=20) | Différence |
-|------|----------|-------------------|------------|
-| Call fixe | 5.7253 | 12.1138 | 6.39 |
-| Put fixe | 3.3050 | 4.0562 | 0.75 |
-| Call flottant | 5.8170 | 4.8101 | 1.01 |
-| Put flottant | 3.3601 | 7.9906 | 4.63 |
+**Résultats Comparatifs** (S₀=100, K=100, r=5%, σ=20%, T=1 an):
+| N | BTM Naïf | Hull-White (M=20) | Erreur HW |
+|---|----------|-------------------|-----------|
+| 2 | 5.8482 | 5.8482 | 0% ✓ |
+| 3 | 5.5272 | 6.3965 | +15.7% |
+| 5 | 5.7167 | 8.7033 | +52.2% |
+| 10 | 5.7253 | 12.1138 | +111.6% |
 
-**Note**: La grande différence suggère qu'il pourrait y avoir des problèmes dans l'implémentation Hull-White, notamment dans la façon dont la moyenne initiale est calculée.
+**Conclusion**: L'implémentation Hull-White actuelle **NE DOIT PAS ÊTRE UTILISÉE** car elle produit des résultats incorrects pour N > 2.
+
+**Solutions**:
+1. Utiliser uniquement **BTM naïf** avec N ≤ 15
+2. Implémenter une méthode **Monte Carlo** pour N > 15
+3. Réécrire complètement l'algorithme Hull-White avec une meilleure gestion des grilles de moyennes
 
 ### 4. **Documentation et Clarté**
 
@@ -92,20 +97,26 @@ Les tests suivants ont été effectués pour valider les corrections:
 
 ## Recommandations
 
-1. **Pour un usage en production**:
-   - Utiliser Hull-White avec M=20-50 pour N > 15
-   - Utiliser BTM naïf seulement pour N ≤ 15
-   - Ajouter un avertissement dans l'interface utilisateur
+1. **URGENT - N'utilisez PAS la méthode Hull-White actuellement**:
+   - Bug critique identifié causant des erreurs de +50% à +100%
+   - Fonctionne uniquement correctement pour N=2
+   - Requiert une réécriture complète
 
-2. **Amélioration Future**:
-   - Implémenter une méthode Monte Carlo pour validation
+2. **Utilisez BTM naïf avec précaution**:
+   - N ≤ 10: bon compromis précision/performance
+   - N ≤ 15: encore acceptable mais lent
+   - N > 15: risque de manque de mémoire (éviter)
+
+3. **Pour un usage en production**:
+   - Implémenter une méthode **Monte Carlo** pour validation
    - Ajouter des approximations analytiques (Turnbull-Wakeman, Curran)
-   - Comparer avec des benchmarks de marché
+   - Réparer ou remplacer complètement l'algorithme Hull-White
 
-3. **Interface Streamlit**:
-   - Ajouter des warnings quand N > 15 avec BTM naïf
+4. **Améliorations Interface Streamlit**:
+   - ⚠️ Ajouter un WARNING rouge pour Hull-White
+   - Bloquer N > 15 pour BTM naïf avec message explicatif
    - Afficher les temps de calcul
-   - Permettre la comparaison côte à côte des deux méthodes
+   - Ajouter un onglet Monte Carlo
 
 ## Références
 
