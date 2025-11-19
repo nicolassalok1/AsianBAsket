@@ -384,10 +384,36 @@ def make_iv_surface_figure(k_grid, t_grid, iv_grid, title_suffix=""):
 
 
 def btm_asian(strike_type, option_type, spot, strike, rate, sigma, maturity, steps):
+    """
+    Prix d'une option asiatique par arbre binomial naïf (BTM).
+    
+    Cette méthode construit un arbre binomial complet et calcule la moyenne arithmétique
+    des prix du sous-jacent à chaque nœud terminal. La complexité est exponentielle O(2^N).
+    
+    Args:
+        strike_type: "fixed" (strike fixe K) ou "floating" (strike = moyenne A_T)
+        option_type: "C" (call) ou "P" (put)
+        spot: Prix spot initial S_0
+        strike: Prix d'exercice K (utilisé seulement si strike_type="fixed")
+        rate: Taux sans risque r
+        sigma: Volatilité σ
+        maturity: Maturité T (en années)
+        steps: Nombre de pas N dans l'arbre binomial
+    
+    Returns:
+        Prix de l'option asiatique
+    
+    Note:
+        - Call fixe: max(A_T - K, 0) où A_T = moyenne arithmétique des prix
+        - Put fixe: max(K - A_T, 0)
+        - Call flottant: max(S_T - A_T, 0)
+        - Put flottant: max(A_T - S_T, 0)
+    """
     delta_t = maturity / steps
     up = np.exp(sigma * np.sqrt(delta_t))
     down = 1.0 / up
     prob = (np.exp(rate * delta_t) - down) / (up - down)
+    discount = np.exp(-rate * delta_t)
 
     spot_paths = [spot]
     avg_paths = [spot]
@@ -415,15 +441,45 @@ def btm_asian(strike_type, option_type, spot, strike, rate, sigma, maturity, ste
         else:
             payoff = np.maximum(avg_paths - spot_paths, 0.0)
 
+    # Récursion arrière avec actualisation à chaque pas
     option_price = payoff.copy()
     for _ in range(steps):
         length = len(option_price) // 2
-        option_price = prob * option_price[:length] + (1 - prob) * option_price[length:]
+        option_price = discount * (prob * option_price[:length] + (1 - prob) * option_price[length:])
 
     return float(option_price[0])
 
 
 def hw_btm_asian(strike_type, option_type, spot, strike, rate, sigma, maturity, steps, m_points):
+    """
+    Prix d'une option asiatique par la méthode de Hull-White (arbre binomial optimisé).
+    
+    Cette méthode utilise une grille bidimensionnelle (étape temporelle, valeur moyenne) pour
+    représenter l'état de l'option. À chaque nœud, on discrétise les valeurs possibles de la
+    moyenne arithmétique en m_points. L'interpolation linéaire est utilisée pour la récursion
+    arrière. La complexité est réduite à O(N^2 * M) où N=steps et M=m_points.
+    
+    Référence: Hull, J.C. & White, A. (1993). "Efficient Procedures for Valuing European
+    and American Path-Dependent Options." Journal of Derivatives, 1(1), 21-31.
+    
+    Args:
+        strike_type: "fixed" (strike fixe K) ou "floating" (strike = moyenne A_T)
+        option_type: "C" (call) ou "P" (put)
+        spot: Prix spot initial S_0
+        strike: Prix d'exercice K (utilisé seulement si strike_type="fixed")
+        rate: Taux sans risque r
+        sigma: Volatilité σ
+        maturity: Maturité T (en années)
+        steps: Nombre de pas N dans l'arbre binomial
+        m_points: Nombre de points de discrétisation pour les valeurs moyennes
+    
+    Returns:
+        Prix de l'option asiatique
+    
+    Note:
+        - Plus m_points est élevé, plus la précision augmente, mais le temps de calcul aussi
+        - Typiquement m_points=10-50 donne un bon compromis précision/performance
+    """
     n_steps = steps
     delta_t = maturity / n_steps
     up = np.exp(sigma * np.sqrt(delta_t))
