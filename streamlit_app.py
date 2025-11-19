@@ -556,6 +556,73 @@ def bs_option_price(time, spot, strike, maturity, rate, sigma, option_kind):
     return float(price)
 
 
+def asian_geometric_closed_form(spot, strike, rate, sigma, maturity, n_obs, option_type):
+    if n_obs < 1:
+        return 0.0
+    dt = maturity / n_obs
+    nu = rate - 0.5 * sigma ** 2
+    sigma_g_sq = (sigma ** 2) * (n_obs + 1) * (2 * n_obs + 1) / (6 * n_obs ** 2)
+    sigma_g = np.sqrt(sigma_g_sq)
+    mu_g = (nu * (n_obs + 1) / (2 * n_obs) + 0.5 * sigma_g_sq) * maturity
+    d1 = (np.log(spot / strike) + mu_g + 0.5 * sigma_g_sq * maturity) / (sigma_g * np.sqrt(maturity))
+    d2 = d1 - sigma_g * np.sqrt(maturity)
+    df = np.exp(-rate * maturity)
+    if option_type == "call":
+        return float(df * (spot * np.exp(mu_g) * norm.cdf(d1) - strike * norm.cdf(d2)))
+    else:
+        return float(df * (strike * norm.cdf(-d2) - spot * np.exp(mu_g) * norm.cdf(-d1)))
+
+
+def asian_mc_control_variate(
+    spot,
+    strike,
+    rate,
+    sigma,
+    maturity,
+    n_obs,
+    n_paths,
+    option_type,
+    antithetic=True,
+    seed=None,
+):
+    if seed is not None:
+        np.random.seed(seed)
+    dt = maturity / n_obs
+    drift = (rate - 0.5 * sigma ** 2) * dt
+    vol_step = sigma * np.sqrt(dt)
+
+    if antithetic:
+        n_base = max(1, n_paths // 2)
+        z_base = np.random.randn(n_obs, n_base)
+        z = np.concatenate([z_base, -z_base], axis=1)
+        n_eff = z.shape[1]
+    else:
+        z = np.random.randn(n_obs, n_paths)
+        n_eff = n_paths
+
+    log_s = np.log(spot) + np.cumsum(drift + vol_step * z, axis=0)
+    s_paths = np.exp(log_s)
+
+    arith_mean = s_paths.mean(axis=0)
+    geom_mean = np.exp(np.log(s_paths).mean(axis=0))
+    if option_type == "call":
+        arith_payoff = np.maximum(arith_mean - strike, 0.0)
+        geom_payoff = np.maximum(geom_mean - strike, 0.0)
+    else:
+        arith_payoff = np.maximum(strike - arith_mean, 0.0)
+        geom_payoff = np.maximum(strike - geom_mean, 0.0)
+    closed_geom = asian_geometric_closed_form(spot, strike, rate, sigma, maturity, n_obs, option_type)
+    cov = np.cov(arith_payoff, geom_payoff)[0, 1]
+    var_geom = np.var(geom_payoff)
+    c = cov / var_geom if var_geom > 0 else 0.0
+    control_estimator = arith_payoff - c * (geom_payoff - closed_geom)
+    disc = np.exp(-rate * maturity)
+    disc_payoff = disc * control_estimator
+    price = np.mean(disc_payoff)
+    stderr = np.std(disc_payoff, ddof=1) / np.sqrt(n_eff)
+    return float(price), float(stderr), float(c)
+
+
 def compute_asian_price(
     strike_type: str,
     option_type: str,
@@ -861,42 +928,14 @@ def ui_asian_options(
     with col2:
         sigma = sigma_common
         st.info(f"Volatilité commune σ = {sigma:.4f}")
-        maturity = maturity_common
-        st.info(f"T commun = {maturity:.4f} années")
-        steps = st.number_input(
-            "Nombre de pas N",
-            value=10,
-            min_value=1,
-            max_value=60,
-            step=1,
-            key="asian_steps",
-        )
+        st.info("Pricing asiatique via Monte Carlo + control variate (méthode notebook).")
 
-    st.subheader("Heatmaps prix asiatique (S0 vs K)")
-    col_s, col_k = st.columns(2)
-    with col_s:
-        s_center = st.session_state.get("common_spot", spot_default)
-        default_s_min = st.session_state.get("asian_s_min", max(0.01, s_center - 20.0))
-        default_s_max = st.session_state.get("asian_s_max", s_center + 20.0)
-        s_min = st.number_input(
-            "S0 min",
-            value=float(default_s_min),
-            min_value=0.01,
-            step=1.0,
-            key="asian_s_min",
-        )
-        s_max = st.number_input(
-            "S0 max",
-            value=float(default_s_max),
-            min_value=s_min + 1.0,
-            step=1.0,
-            key="asian_s_max",
-        )
-        st.caption(f"Domaine S0 utilisé: [{s_min:.2f}, {s_max:.2f}] pas 1")
+    st.subheader("Heatmaps prix asiatiques (K vs T)")
+    col_k, col_t = st.columns(2)
     with col_k:
         k_center = st.session_state.get("common_strike", strike_common)
-        default_k_min = st.session_state.get("asian_k_min", max(0.01, k_center - 20.0))
-        default_k_max = st.session_state.get("asian_k_max", k_center + 20.0)
+        default_k_min = st.session_state.get("asian_k_min", max(0.01, k_center - 40.0))
+        default_k_max = st.session_state.get("asian_k_max", k_center + 40.0)
         k_min = st.number_input(
             "K min",
             value=float(default_k_min),
@@ -911,46 +950,96 @@ def ui_asian_options(
             step=1.0,
             key="asian_k_max",
         )
-        st.caption(f"Domaine K utilisé: [{k_min:.2f}, {k_max:.2f}] pas 1")
-
-    s_vals = np.arange(s_min, s_max + 1.0, 1.0, dtype=float)
-    k_vals = np.arange(k_min, k_max + 1.0, 1.0, dtype=float)
-
-    tab_btm, tab_hw = st.tabs(["BTM naïf", "Hull-White (HW_BTM)"])
-
-    with tab_btm:
-        _render_asian_heatmaps_for_model(
-            model="BTM naïf",
-            s_vals=s_vals,
-            k_vals=k_vals,
-            sigma=sigma,
-            maturity=maturity,
-            steps=steps,
-            m_points=None,
-            strike_common=strike_common_local,
-            rate_common=rate_common,
+        st.caption(f"Domaine K: [{k_min:.2f}, {k_max:.2f}]")
+    with col_t:
+        t_center = st.session_state.get("common_maturity", maturity_common)
+        default_t_min = st.session_state.get("asian_t_min", max(0.05, t_center / 2.0))
+        default_t_max = st.session_state.get("asian_t_max", t_center * 2.0)
+        t_min = st.number_input(
+            "T min (années)",
+            value=float(default_t_min),
+            min_value=0.01,
+            step=0.05,
+            key="asian_t_min",
         )
+        t_max = st.number_input(
+            "T max (années)",
+            value=float(default_t_max),
+            min_value=t_min + 0.01,
+            step=0.05,
+            key="asian_t_max",
+        )
+        st.caption(f"Domaine T: [{t_min:.2f}, {t_max:.2f}]")
 
-    with tab_hw:
-        m_points = st.number_input(
-            "Nombre de points de moyenne M (Hull-White)",
-            value=10,
-            min_value=2,
-            max_value=200,
-            step=1,
-            key="asian_m_points_hw",
-        )
-        _render_asian_heatmaps_for_model(
-            model="Hull-White (HW_BTM)",
-            s_vals=s_vals,
-            k_vals=k_vals,
-            sigma=sigma,
-            maturity=maturity,
-            steps=steps,
-            m_points=m_points,
-            strike_common=strike_common_local,
-            rate_common=rate_common,
-        )
+    n_k = st.slider("Résolution en K", 10, 40, 20, 2, key="asian_n_k")
+    n_t = st.slider("Résolution en T", 10, 40, 20, 2, key="asian_n_t")
+    n_paths_surface = st.slider("Nombre de trajectoires Monte Carlo", 5_000, 50_000, 20_000, 5_000, key="asian_n_paths")
+
+    k_vals = np.linspace(k_min, k_max, n_k)
+    t_vals = np.linspace(t_min, t_max, n_t)
+
+    prices_call = np.zeros((n_t, n_k), dtype=float)
+    prices_put = np.zeros((n_t, n_k), dtype=float)
+
+    with st.spinner("Calcul des surfaces de prix (MC asiatique)…"):
+        for i_t, t_val in enumerate(t_vals):
+            n_obs = max(2, int(50 * t_val))
+            for i_k, k_val in enumerate(k_vals):
+                call_price, _, _ = asian_mc_control_variate(
+                    spot=float(spot_common),
+                    strike=float(k_val),
+                    rate=float(rate_common),
+                    sigma=float(sigma),
+                    maturity=float(t_val),
+                    n_obs=int(n_obs),
+                    n_paths=int(n_paths_surface),
+                    option_type="call",
+                    antithetic=True,
+                    seed=None,
+                )
+                put_price, _, _ = asian_mc_control_variate(
+                    spot=float(spot_common),
+                    strike=float(k_val),
+                    rate=float(rate_common),
+                    sigma=float(sigma),
+                    maturity=float(t_val),
+                    n_obs=int(n_obs),
+                    n_paths=int(n_paths_surface),
+                    option_type="put",
+                    antithetic=True,
+                    seed=None,
+                )
+                prices_call[i_t, i_k] = call_price
+                prices_put[i_t, i_k] = put_price
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    im0 = axes[0].imshow(
+        prices_call,
+        origin="lower",
+        extent=[k_vals.min(), k_vals.max(), t_vals.min(), t_vals.max()],
+        aspect="auto",
+        cmap="viridis",
+    )
+    axes[0].set_xlabel("Strike K")
+    axes[0].set_ylabel("Maturité T (années)")
+    axes[0].set_title("Call asiatique arithmétique (MC + control variate)")
+    fig.colorbar(im0, ax=axes[0], label="Prix")
+
+    im1 = axes[1].imshow(
+        prices_put,
+        origin="lower",
+        extent=[k_vals.min(), k_vals.max(), t_vals.min(), t_vals.max()],
+        aspect="auto",
+        cmap="viridis",
+    )
+    axes[1].set_xlabel("Strike K")
+    axes[1].set_ylabel("Maturité T (années)")
+    axes[1].set_title("Put asiatique arithmétique (MC + control variate)")
+    fig.colorbar(im1, ax=axes[1], label="Prix")
+
+    plt.tight_layout()
+    st.pyplot(fig)
 
 
 def main():
